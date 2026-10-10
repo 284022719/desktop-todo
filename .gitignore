@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 本程序的数据文件在 ~/.local/share/desktop-todo/，
+# 万一被拷到本目录也不该进仓库
+todos.json
+todos.json.broken
