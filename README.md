@@ -116,3 +116,7 @@ Icon=checkbox-checked
 Terminal=false
 Categories=Utility;
 ```
+
+## 许可证
+
+MIT License，见 [LICENSE](LICENSE)。
