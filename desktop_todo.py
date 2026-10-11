@@ -437,6 +437,187 @@ def _win_has_dpi_api():
 
 
 # --------------------------------------------------------------------------- #
+# 托盘图标（Win32 Shell_NotifyIcon，纯 ctypes，零第三方依赖）
+#
+# 为什么需要：窗口默认不进任务栏，Windows 上也不在 Alt+Tab 里（WS_EX_TOOLWINDOW
+# 的代价），被别的窗口盖住后不好找。挂一个托盘图标后：左键唤回窗口，右键弹出与本
+# 程序一致的菜单（含「隐藏窗口」「退出」）。
+#
+# 为什么用「轮询」而不是 Shell_NotifyIcon 的回调消息：
+#   回调消息是发给某个窗口的，正常做法是把 Tk 顶层窗口的 WndProc 子类化，再从
+#   C 回调里回到 Python。2026-10-11 实测：那样会在 Tk 的 update() 内部触发
+#       Fatal Python error: PyEval_RestoreThread: ... the GIL is released
+#   直接把进程打崩。所以改成：挂图标时**不要**回调消息（不设 NIF_MESSAGE），
+#   在 Tk 自己的定时器里每 TRAY_POLL_MS 毫秒查一次「光标是否落在本图标矩形内 +
+#   左/右键是否刚松开」——全程只有 Tk 的事件循环，没有任何 C→Python 回调。
+#
+# 只在 Windows 上启用；Linux 侧仍是「再运行一次本程序」唤回（见 X11Backend）。
+# --------------------------------------------------------------------------- #
+TRAY_UID = 1
+NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
+NIF_ICON, NIF_TIP = 0x00000002, 0x00000004
+IDI_APPLICATION = 32512
+TRAY_TIP = "桌面待办清单（左键显示 / 右键菜单）"
+TRAY_POLL_MS = 120                      # 轮询托盘点击的间隔
+VK_LBUTTON, VK_RBUTTON = 0x01, 0x02
+
+
+class _NotifyIconData(ctypes.Structure):
+    """NOTIFYICONDATAW（用 v2 的大小，够用；不含 v3 的 guidItem）。"""
+
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("hWnd", ctypes.c_void_p),
+        ("uID", ctypes.c_uint),
+        ("uFlags", ctypes.c_uint),
+        ("uCallbackMessage", ctypes.c_uint),
+        ("hIcon", ctypes.c_void_p),
+        ("szTip", ctypes.c_wchar * 128),
+        ("dwState", ctypes.c_uint),
+        ("dwStateMask", ctypes.c_uint),
+        ("szInfo", ctypes.c_wchar * 256),
+        ("uVersion", ctypes.c_uint),
+        ("szInfoTitle", ctypes.c_wchar * 64),
+        ("dwInfoFlags", ctypes.c_uint),
+    ]
+
+
+class _NotifyIconIdentifier(ctypes.Structure):
+    """NOTIFYICONIDENTIFIER：给 Shell_NotifyIconGetRect 定位图标用。"""
+
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("hWnd", ctypes.c_void_p),
+        ("uID", ctypes.c_uint),
+        ("guidItem", ctypes.c_byte * 16),
+    ]
+
+
+class _TrayRect(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+def _shell32():
+    if os.name != "nt":
+        return None
+    try:
+        return ctypes.WinDLL("shell32", use_last_error=True)
+    except Exception:
+        return None
+
+
+def win32_tray_icon():
+    """取一个托盘图标句柄：暂时用系统默认图标（自绘图标以后再说）。"""
+    api = _win_api()
+    if api is None:
+        return 0
+    user32 = api[0]
+    user32.LoadIconW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    user32.LoadIconW.restype = ctypes.c_void_p
+    return int(user32.LoadIconW(None, ctypes.c_void_p(IDI_APPLICATION)) or 0)
+
+
+def _notify_data(hwnd, hicon=None, tip=None):
+    data = _NotifyIconData()
+    data.cbSize = ctypes.sizeof(_NotifyIconData)
+    data.hWnd = ctypes.c_void_p(hwnd)
+    data.uID = TRAY_UID
+    if hicon:
+        data.uFlags |= NIF_ICON
+        data.hIcon = ctypes.c_void_p(hicon)
+    if tip:
+        data.uFlags |= NIF_TIP
+        data.szTip = tip
+    # 故意不设 NIF_MESSAGE：不用回调消息（原因见本节顶部注释）
+    return data
+
+
+def win32_tray_add(hwnd, hicon, tip=TRAY_TIP):
+    """把图标挂进托盘；返回是否成功。"""
+    shell32 = _shell32()
+    if shell32 is None or not hwnd:
+        return False
+    shell32.Shell_NotifyIconW.argtypes = [ctypes.c_uint,
+                                          ctypes.POINTER(_NotifyIconData)]
+    shell32.Shell_NotifyIconW.restype = ctypes.c_int
+    data = _notify_data(hwnd, hicon, tip)
+    return bool(shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(data)))
+
+
+def win32_tray_remove(hwnd):
+    """从托盘摘掉图标（窗口销毁前必须调用）。"""
+    shell32 = _shell32()
+    if shell32 is None or not hwnd:
+        return False
+    shell32.Shell_NotifyIconW.argtypes = [ctypes.c_uint,
+                                          ctypes.POINTER(_NotifyIconData)]
+    shell32.Shell_NotifyIconW.restype = ctypes.c_int
+    data = _notify_data(hwnd)
+    return bool(shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(data)))
+
+
+def win32_tray_rect(hwnd):
+    """图标在屏幕上的矩形：返回 (是否可见, left, top, right, bottom)。
+
+    图标被收进托盘溢出区、当前没显示时会返回「不可见」——那种情况下本来就点不到它。
+    """
+    shell32 = _shell32()
+    if shell32 is None or not hwnd:
+        return (False, 0, 0, 0, 0)
+    identifier = _NotifyIconIdentifier()
+    identifier.cbSize = ctypes.sizeof(_NotifyIconIdentifier)
+    identifier.hWnd = ctypes.c_void_p(hwnd)
+    identifier.uID = TRAY_UID
+    rect = _TrayRect()
+    shell32.Shell_NotifyIconGetRect.argtypes = [ctypes.POINTER(_NotifyIconIdentifier),
+                                               ctypes.POINTER(_TrayRect)]
+    shell32.Shell_NotifyIconGetRect.restype = ctypes.c_long        # HRESULT
+    if shell32.Shell_NotifyIconGetRect(ctypes.byref(identifier),
+                                       ctypes.byref(rect)) != 0:   # S_OK == 0
+        return (False, 0, 0, 0, 0)
+    return (True, int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+
+
+def win32_mouse_buttons():
+    """(左键是否按下, 右键是否按下)：取 GetAsyncKeyState 的高位（当前状态）。"""
+    api = _win_api()
+    if api is None:
+        return (False, False)
+    user32 = api[0]
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    left = bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+    right = bool(user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000)
+    return (left, right)
+
+
+def win32_cursor_pos():
+    """鼠标当前位置（托盘右键菜单要弹在那儿）。取不到返回 (0, 0)。"""
+    api = _win_api()
+    if api is None:
+        return (0, 0)
+    user32 = api[0]
+
+    class _Point(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    point = _Point()
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(_Point)]
+    user32.GetCursorPos.restype = ctypes.c_int
+    if not user32.GetCursorPos(ctypes.byref(point)):
+        return (0, 0)
+    return (int(point.x), int(point.y))
+
+
+def win32_has_tray_api():
+    """shell32 里有没有 Shell_NotifyIconW / Shell_NotifyIconGetRect（给 --doctor 用）。"""
+    shell32 = _shell32()
+    return bool(shell32 is not None and hasattr(shell32, "Shell_NotifyIconW")
+                and hasattr(shell32, "Shell_NotifyIconGetRect"))
+
+
+# --------------------------------------------------------------------------- #
 # 平台后端
 #
 # 平台差异只有三处：窗口外观、数据与自启位置、单实例唤回。都收在这里：
@@ -463,6 +644,13 @@ class PlatformBackend(object):
     def set_skip_taskbar(self, root):
         """让窗口不出现在任务栏 / dock 里。返回是否成功。"""
         return False
+
+    def tray_install(self, root, on_activate, on_menu):
+        """挂托盘图标：on_activate() 左键唤回，on_menu() 右键弹菜单。返回是否成功。"""
+        return False
+
+    def tray_remove(self, root):
+        """摘掉托盘图标（窗口销毁前调用）。"""
 
     def activate_window(self, root, topmost):
         """把窗口叫到最前面，且不改变用户设置的「始终置顶」状态。"""
@@ -628,6 +816,14 @@ class WindowsBackend(PlatformBackend):
 
     def __init__(self):
         self._mutex = 0
+        # 托盘状态（轮询式，不用回调消息；原因见「托盘图标」一节顶部）
+        self._tray_added = False
+        self._tray_hwnd = 0
+        self._tray_icon = 0
+        self._tray_job = None
+        self._tray_left_down = False
+        self._tray_right_down = False
+        self._tray_menu_open = False
 
     def prepare_process(self):
         win32_set_dpi_aware()
@@ -665,6 +861,78 @@ class WindowsBackend(PlatformBackend):
         if not hwnd:
             return False
         return win32_activate_hwnd(hwnd)
+
+    # ---- 托盘图标 ----
+    def tray_install(self, root, on_activate, on_menu):
+        """挂托盘图标：左键唤回、右键弹菜单。
+
+        不用 Shell_NotifyIcon 的回调消息（那要子类化 Tk 窗口过程，实测会把进程打崩，
+        见「托盘图标」一节顶部注释），改成在 Tk 定时器里查「光标在不在图标上 +
+        按键是不是刚松开」。
+        """
+        if _win_api() is None:
+            return False
+        hwnd = win32_top_window(root)
+        if not hwnd:
+            return False
+        self._tray_hwnd = hwnd
+        self._tray_icon = win32_tray_icon()
+        self._tray_added = win32_tray_add(hwnd, self._tray_icon)
+        if not self._tray_added:
+            return False
+
+        def poll():
+            self._tray_job = None
+            try:
+                self._tray_poll(root, on_activate, on_menu)
+            except Exception:
+                pass
+            try:
+                if self._tray_added:
+                    self._tray_job = root.after(TRAY_POLL_MS, poll)
+            except Exception:
+                self._tray_job = None
+
+        self._tray_job = root.after(TRAY_POLL_MS, poll)
+        return True
+
+    def _tray_poll(self, root, on_activate, on_menu):
+        """一次点击检测：按键由「按下」变「松开」、且光标在图标矩形内，才算点中它。"""
+        left, right = win32_mouse_buttons()
+        was_left, was_right = self._tray_left_down, self._tray_right_down
+        self._tray_left_down, self._tray_right_down = left, right
+        if not (was_left or was_right):
+            return
+        visible, icon_left, icon_top, icon_right, icon_bottom = \
+            win32_tray_rect(self._tray_hwnd)
+        if not visible:
+            return
+        x, y = win32_cursor_pos()
+        if not (icon_left <= x <= icon_right and icon_top <= y <= icon_bottom):
+            return
+        if was_left and not left:
+            on_activate()
+        elif was_right and not right and not self._tray_menu_open:
+            self._tray_menu_open = True
+            try:
+                on_menu()
+            finally:
+                self._tray_menu_open = False
+
+    def tray_remove(self, root):
+        """摘掉图标并停掉轮询（窗口销毁前调用）。"""
+        if self._tray_job is not None:
+            try:
+                root.after_cancel(self._tray_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._tray_job = None
+        if self._tray_added and self._tray_hwnd:
+            win32_tray_remove(self._tray_hwnd)
+        self._tray_added = False
+        self._tray_left_down = False
+        self._tray_right_down = False
+        self._tray_menu_open = False
 
     def data_dir(self):
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
@@ -989,6 +1257,9 @@ class TodoWidget(object):
             self._restore_position()      # 映射后再落一次，避免 WM 摆放时挪位
             self.backend.single_instance_start(self.root, self.raise_window)
             self.backend.set_skip_taskbar(self.root)   # 映射后再补一次（KWin 只对已托管的窗口处理）
+            # 挂托盘图标：左键唤回、右键弹菜单（Windows 实现；其它平台是空操作）
+            self._tray_on = self.backend.tray_install(
+                self.root, self.raise_window, self._popup_menu_at_cursor)
 
     # ---- 单实例 / 唤回 ----
     def raise_window(self):
@@ -998,6 +1269,27 @@ class TodoWidget(object):
         Windows 是命名互斥体；唤回动作由后端按平台实现。
         """
         self.backend.activate_window(self.root, self.store.ui["topmost"])
+
+    def _popup_menu_at_cursor(self):
+        """托盘右键：在鼠标位置弹出与本程序一致的菜单。"""
+        x, y = win32_cursor_pos()
+        try:
+            self.menu.tk_popup(x, y)
+        finally:
+            try:
+                self.menu.grab_release()
+            except tk.TclError:
+                pass
+
+    def toggle_hidden(self):
+        """隐藏 / 显示窗口：隐藏之后从托盘图标左键唤回（免得和「退出」混在一起）。"""
+        try:
+            if self.root.winfo_viewable():
+                self.root.withdraw()
+            else:
+                self.raise_window()
+        except tk.TclError:
+            pass
 
     # ---- 字体 ----
     def _make_fonts(self):
@@ -1126,6 +1418,7 @@ class TodoWidget(object):
     def _build_menu(self):
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="折叠 / 展开", command=self.toggle_collapsed)
+        menu.add_command(label="隐藏窗口（托盘左键唤回）", command=self.toggle_hidden)
         self._topmost_var = tk.BooleanVar(value=bool(self.store.ui["topmost"]))
         menu.add_checkbutton(label="始终置顶", variable=self._topmost_var, command=self._apply_topmost)
         self._alpha_var = tk.DoubleVar(value=float(self.store.ui["alpha"]))
@@ -1684,6 +1977,7 @@ class TodoWidget(object):
         except tk.TclError:
             pass
         self._stop_autoscroll()
+        self.backend.tray_remove(self.root)       # 先摘托盘图标并还原窗口过程
         self.backend.single_instance_stop(self.root)
         self.store.save()
         self.root.destroy()
@@ -2025,6 +2319,8 @@ def run_doctor():
     # ---- 环境与路径 ----
     row("env", "os / sys.platform", "%s / %s" % (os.name, sys.platform))
     row("env", "窗口后端", get_backend().name)
+    row("env", "托盘图标", "Shell_NotifyIcon 可用（左键唤回 / 右键菜单）"
+        if win32_has_tray_api() else "当前平台未实现（仍靠再运行一次唤回）")
     row("env", "python", sys.version.split()[0])
     row("env", "脚本路径", os.path.abspath(__file__))
     row("env", "tk", "Tk %s" % tk.TkVersion if tk else "缺失（统信 UOS: apt install python3-tk）")
@@ -2188,6 +2484,11 @@ def main(argv=None):
 
     root = tk.Tk()
     widget = TodoWidget(root, Store(data_file()))
+    if os.environ.get("DESKTOP_TODO_VERBOSE"):
+        # 默认不输出；排障时设 DESKTOP_TODO_VERBOSE=1 就能看到托盘有没有挂上
+        print("窗口后端 = %s" % get_backend().name)
+        print("托盘图标 = %s" % bool(getattr(widget, "_tray_on", False)))
+        print("数据文件 = %s" % data_file())
     root.mainloop()
     return 0
 

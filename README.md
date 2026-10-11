@@ -8,8 +8,9 @@
 > 只用 Python 标准库、零第三方依赖。
 >
 > **默认不置顶**：它就是普通窗口，别的窗口盖上来就把它盖住，不会一直挡在前面。
-> **它也不在任务栏 / dock 里显示图标**；被盖住时用 `Alt+Tab`（Windows 上见
-> 「平台差异」一节），或者**再运行一次同样的命令**，就能把它叫到最前面。
+> **它也不在任务栏 / dock 里显示图标**；Windows 上会在右下托盘挂一个图标，
+> **左键唤回窗口、右键弹出菜单**（Linux 侧见「平台差异」）。
+> 也可以**再运行一次同样的命令**把它叫到最前面——不会开出第二个窗口。
 > 确实想让它一直浮在最上面时，在右键菜单里勾「始终置顶」（勾选状态会记住）。
 
 ![预览](preview.png)
@@ -40,8 +41,12 @@ cd D:\个人项目\desktop-todo
 python desktop_todo.py
 ```
 
+- **Windows 上右下托盘会有一个图标**：左键唤回窗口，右键弹出与本程序一致的菜单
+  （含「隐藏窗口」「退出」）。Windows 11 默认把新图标收进托盘的溢出区（点托盘左边的
+  `^` 能看到），把它拖到常显位置就会一直露着。排障时可以设 `DESKTOP_TODO_VERBOSE=1`
+  启动，程序会额外打印窗口后端、托盘是否挂上、数据文件路径。
 - **再运行一次同样的命令 = 把已经在跑的窗口叫到最前面**（不会开出第二个窗口）。
-  它不在任务栏里，所以这就是最顺手的唤回方式；`Alt+Tab` 里能不能找到它取决于平台
+  它不在任务栏里，所以这也是最顺手的唤回方式；`Alt+Tab` 里能不能找到它取决于平台
   （Windows 上 `WS_EX_TOOLWINDOW` 会把它从 `Alt+Tab` 里也拿掉，见「平台差异」）。
 - 关掉它：点右上角 `×`；Linux 上也可以 `pkill -f desktop_todo.py`。
 
@@ -99,14 +104,15 @@ python3 desktop_todo.py --doctor
 
 ## 平台差异
 
-平台相关的东西只有三处，都收在 `PlatformBackend` / `X11Backend` / `WindowsBackend`
-里，业务代码只认接口（`get_backend()`）：
+平台相关的东西只有四处（窗口外观、数据与自启路径、单实例唤回、托盘图标），都收在
+`PlatformBackend` / `X11Backend` / `WindowsBackend` 里，业务代码只认接口（`get_backend()`）：
 
 | | 统信 UOS / Deepin（X11） | Windows 11 |
 | --- | --- | --- |
 | 去标题栏 | `_MOTIF_WM_HINTS` 的 `decorations=0`（窗口仍由 WM 托管，输入框能拿焦点） | 清掉 `WS_CAPTION` + `WS_THICKFRAME`（同样保留系统托管） |
 | 不进任务栏 | EWMH 的 `_NET_WM_STATE_SKIP_TASKBAR` + `SKIP_PAGER` | `WS_EX_TOOLWINDOW` |
-| 唤回（再运行一次） | unix 套接字发 `raise`，窗口 `lift()` + 短暂置顶 + `focus_force()` | 命名互斥体判重，第二个进程直接 `FindWindowW` + `SetForegroundWindow` |
+| 唤回（再运行一次） | unix 套接字发 `raise`，窗口 `lift()` + 短暂置顶 + `focus_force()` | 以「窗口还在不在」为准，直接 `FindWindowW` + `SetForegroundWindow` |
+| 托盘图标 | 未实现（仍靠再运行一次唤回） | `Shell_NotifyIcon`：左键唤回 / 右键菜单 |
 | 数据目录 | `$XDG_DATA_HOME` 或 `~/.local/share/desktop-todo` | `%APPDATA%\desktop-todo` |
 | 开机自启 | `~/.config/autostart/desktop-todo.desktop` | `HKCU\...\Run`，用 `pythonw.exe` 启动 |
 | 中文字体 | Noto Sans CJK SC / 思源黑体 / 文泉驿微米黑 | Microsoft YaHei UI |
@@ -133,8 +139,18 @@ python3 desktop_todo.py --doctor
 - **单实例 + 唤回**：Linux 上程序在 `$XDG_RUNTIME_DIR/desktop-todo.sock` 上监听一个
   unix 套接字；第二次启动时先连它，连上就发一句 `raise` 然后自己退出，
   于是 `lift()` + 短暂置顶 + `focus_force()` 把已有窗口叫到前面。Windows 上 Python
-  没有 `AF_UNIX`、Tk 也没有 `createfilehandler`，所以改用命名互斥体判重 + 按标题
-  找窗口直接激活。任务栏里没有入口的情况下，这就是最可靠的找回方式。
+  没有 `AF_UNIX`、Tk 也没有 `createfilehandler`，所以改用「按标题找窗口」判重：
+  窗口还在就唤回它、自己退出（命名互斥体只当旁证）。任务栏里没有入口的情况下，
+  这就是最可靠的找回方式。
+- **托盘图标（Windows）**：用 `Shell_NotifyIcon` 挂图标，但**不用它的回调消息**——
+  那需要把 Tk 顶层窗口的 `WndProc` 子类化、再从 C 回调里回到 Python；2026-10-11 实测
+  会在 Tk 的 `update()` 内部触发
+  `Fatal Python error: PyEval_RestoreThread ... the GIL is released`，直接把进程打崩。
+  改成挂图标时不设 `NIF_MESSAGE`，在 Tk 的定时器里每 120ms 查一次「光标是否落在
+  `Shell_NotifyIconGetRect` 给出的图标矩形内 + 左/右键是不是刚松开」——全程只有 Tk
+  自己的事件循环，没有任何 C→Python 回调。右键菜单直接复用程序自己的菜单
+  （`tk_popup` 弹在鼠标位置）。图标被收进溢出区、当前不可见时查不到矩形，
+  而那时本来也点不到它。
 - **Windows 的窗口句柄**：`winfo_id()` 拿到的是 Tk 的子窗口，真正的顶层窗口要
   `GetAncestor(GA_ROOT)` 再上一层——等价于 X11 那边用 `XQueryTree` 找 WM frame。
 - `topmost` 默认 `false`：只在右键菜单里显式勾选时才会置顶（Linux 走
