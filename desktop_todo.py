@@ -1742,7 +1742,9 @@ def run_doctor():
 
     # ---- 环境与路径 ----
     row("env", "os / sys.platform", "%s / %s" % (os.name, sys.platform))
+    row("env", "窗口后端", get_backend().name)
     row("env", "python", sys.version.split()[0])
+    row("env", "脚本路径", os.path.abspath(__file__))
     row("env", "tk", "Tk %s" % tk.TkVersion)
     row("env", "DISPLAY", os.environ.get("DISPLAY") or "(未设置)")
     row("env", "WAYLAND_DISPLAY", os.environ.get("WAYLAND_DISPLAY") or "(未设置)")
