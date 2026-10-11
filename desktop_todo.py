@@ -89,6 +89,7 @@ FONT_STACK = (
     "Noto Sans CJK SC",
     "Source Han Sans SC",
     "WenQuanYi Micro Hei",
+    "Microsoft YaHei UI",
     "Microsoft YaHei",
     "Droid Sans Fallback",
     "DejaVu Sans",
@@ -336,17 +337,30 @@ def win32_make_borderless(root):
     return bool(user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, flags))
 
 
-def win32_activate(root):
-    """把已有窗口叫到最前面（「再运行一次本程序」的唤回动作用它）。"""
+def win32_find_window(title):
+    """按标题找顶层窗口；找不到返回 0。"""
     api = _win_api()
     if api is None:
+        return 0
+    try:
+        return int(api[0].FindWindowW(None, title) or 0)
+    except Exception:
+        return 0
+
+
+def win32_activate_hwnd(hwnd):
+    """把指定窗口恢复并切到前台；返回是否成功。"""
+    api = _win_api()
+    if api is None or not hwnd:
         return False
     user32 = api[0]
-    hwnd = win32_top_window(root)
-    if not hwnd:
-        return False
     user32.ShowWindow(hwnd, WIN_SW_RESTORE)
     return bool(user32.SetForegroundWindow(hwnd))
+
+
+def win32_activate(root):
+    """把已有窗口叫到最前面（「再运行一次本程序」的唤回动作用它）。"""
+    return win32_activate_hwnd(win32_top_window(root))
 
 
 def win32_instance_mutex(name):
@@ -381,12 +395,296 @@ def _win_has_dpi_api():
 
 
 # --------------------------------------------------------------------------- #
+# 平台后端
+#
+# 平台差异只有三处：窗口外观、数据与自启位置、单实例唤回。都收在这里：
+#   * X11Backend   —— 就是本项目原来那套 X11 / EWMH 代码，逐条对齐，不改写行为；
+#   * WindowsBackend —— 纯 ctypes 的 Win32 调用（2026-10-11 在 Win11 上实测过）。
+# 业务代码只认 PlatformBackend 的接口，不再直接碰平台 API。
+# --------------------------------------------------------------------------- #
+WINDOW_TITLE = "桌面待办清单"
+AUTOSTART_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+class PlatformBackend(object):
+    """平台能力接口；没实现的地方给保守默认值。"""
+
+    name = "base"
+
+    def prepare_process(self):
+        """在创建 Tk() 之前调用（Windows 的 DPI 感知必须在 Tk 之前声明）。"""
+
+    def strip_decorations(self, root):
+        """去掉标题栏。返回是否成功。"""
+        return False
+
+    def set_skip_taskbar(self, root):
+        """让窗口不出现在任务栏 / dock 里。返回是否成功。"""
+        return False
+
+    def activate_window(self, root, topmost):
+        """把窗口叫到最前面，且不改变用户设置的「始终置顶」状态。"""
+        try:
+            root.deiconify()
+            root.lift()
+            root.attributes("-topmost", True)      # 短暂置顶，确保能从别的窗口后面冒出来
+            root.focus_force()
+            root.after(400, lambda: root.attributes("-topmost", bool(topmost)))
+        except tk.TclError:
+            pass
+
+    def single_instance_start(self, root, on_raise):
+        """接管单实例：第二个进程需要唤回时调用 on_raise()。"""
+
+    def single_instance_stop(self, root):
+        """释放单实例占用的资源。"""
+
+    def raise_running_instance(self):
+        """已有实例在跑就把它叫到最前面并返回 True。"""
+        return False
+
+    def data_dir(self):
+        """数据目录（Linux 遵循 XDG_DATA_HOME）。"""
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share")
+        return os.path.join(base, APP_ID)
+
+    def autostart_target(self):
+        """开机自启的落点（给人看的字符串）。"""
+        return "(当前平台未实现)"
+
+    def autostart_install(self):
+        """写入开机自启，返回退出码。"""
+        sys.stderr.write("当前平台未实现开机自启\n")
+        return 1
+
+    def autostart_uninstall(self):
+        """移除开机自启，返回退出码。"""
+        sys.stderr.write("当前平台未实现开机自启\n")
+        return 1
+
+
+class X11Backend(PlatformBackend):
+    """Linux / X11：与原实现逐条等价。"""
+
+    name = "x11"
+
+    def __init__(self):
+        self._server = None
+
+    def strip_decorations(self, root):
+        return strip_window_decorations(root)
+
+    def set_skip_taskbar(self, root):
+        return set_skip_taskbar(root)
+
+    # ---- 单实例：unix 套接字 + Tk 文件事件（原 _start_ipc / _on_ipc / _stop_ipc）----
+    def single_instance_start(self, root, on_raise):
+        path = ipc_socket_path()
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+            server.bind(path)
+            server.listen(2)
+            server.setblocking(False)
+        except OSError:
+            server.close()
+            return
+        self._server = server
+
+        def on_readable(_server, _mask):
+            try:
+                connection, _ = server.accept()
+            except OSError:
+                return
+            try:
+                connection.recv(64)
+                connection.sendall(b"ok\n")
+            except OSError:
+                pass
+            finally:
+                connection.close()
+            on_raise()
+
+        try:
+            root.tk.createfilehandler(server, tk.READABLE, on_readable)
+        except (tk.TclError, AttributeError):
+            self._server = None
+
+    def single_instance_stop(self, root):
+        if self._server is None:
+            return
+        path = ipc_socket_path()
+        try:
+            root.tk.deletefilehandler(self._server)
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            self._server.close()
+        except OSError:
+            pass
+        self._server = None
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except OSError:
+            pass
+
+    def raise_running_instance(self):
+        return raise_running_instance()
+
+    # ---- 开机自启：~/.config/autostart/*.desktop ----
+    def autostart_target(self):
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+            os.path.expanduser("~"), ".config")
+        return os.path.join(base, "autostart", "%s.desktop" % APP_ID)
+
+    def autostart_install(self):
+        script = os.path.abspath(__file__)
+        entry = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=桌面待办清单\n"
+            "Name[en]=Desktop To-do\n"
+            "Comment=常驻桌面的待办清单挂件\n"
+            "Comment[en]=Always-on-top desktop to-do widget\n"
+            "Exec=%s %s\n"
+            "Icon=checkbox-checked\n"
+            "Terminal=false\n"
+            "Categories=Utility;\n"
+            "StartupNotify=false\n"
+            "X-GNOME-Autostart-enabled=true\n"
+        ) % (sys.executable, script)
+        target = self.autostart_target()
+        directory = os.path.dirname(target)
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(entry)
+        print("已写入开机自启: %s" % target)
+        return 0
+
+    def autostart_uninstall(self):
+        target = self.autostart_target()
+        if os.path.exists(target):
+            os.remove(target)
+            print("已移除开机自启: %s" % target)
+        else:
+            print("未找到开机自启项: %s" % target)
+        return 0
+
+
+class WindowsBackend(PlatformBackend):
+    """Windows 11：纯 ctypes 的 Win32 实现。
+
+    去标题栏与「不进任务栏」是同一次样式修改（清 WS_CAPTION/WS_THICKFRAME +
+    加 WS_EX_TOOLWINDOW），所以两个方法都走 win32_make_borderless，幂等。
+    """
+
+    name = "win32"
+
+    def __init__(self):
+        self._mutex = 0
+
+    def prepare_process(self):
+        win32_set_dpi_aware()
+
+    def strip_decorations(self, root):
+        return win32_make_borderless(root)
+
+    def set_skip_taskbar(self, root):
+        return win32_make_borderless(root)
+
+    def activate_window(self, root, topmost):
+        PlatformBackend.activate_window(self, root, topmost)
+        win32_activate(root)
+
+    # ---- 单实例：命名互斥体（Windows 没有 AF_UNIX）----
+    def single_instance_start(self, root, on_raise):
+        handle, existing = win32_instance_mutex("%s-instance" % APP_ID)
+        self._mutex = handle          # 持到进程结束，第二个实例才会看到 183
+        return existing
+
+    def single_instance_stop(self, root):
+        api = _win_api()
+        if self._mutex and api is not None:
+            api[1].CloseHandle(self._mutex)
+        self._mutex = 0
+
+    def raise_running_instance(self):
+        """第二个进程自己去找那个窗口并激活，不需要 IPC 服务端。"""
+        handle, existing = win32_instance_mutex("%s-instance" % APP_ID)
+        api = _win_api()
+        if handle and api is not None:
+            api[1].CloseHandle(handle)
+        if not existing:
+            return False
+        hwnd = win32_find_window(WINDOW_TITLE)
+        if not hwnd:
+            return False
+        return win32_activate_hwnd(hwnd)
+
+    def data_dir(self):
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, APP_ID)
+
+    # ---- 开机自启：HKCU 的 Run 键（用 pythonw.exe，避免每次开机弹黑框）----
+    def autostart_target(self):
+        return r"HKCU\%s\%s" % (AUTOSTART_RUN_KEY, APP_ID)
+
+    def autostart_install(self):
+        import winreg
+        script = os.path.abspath(__file__)
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        if not os.path.exists(pythonw):
+            pythonw = sys.executable
+        command = '"%s" "%s"' % (pythonw, script)
+        try:
+            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_KEY)
+            winreg.SetValueEx(key, APP_ID, 0, winreg.REG_SZ, command)
+            winreg.CloseKey(key)
+        except OSError as error:
+            sys.stderr.write("写入开机自启失败: %r\n" % (error,))
+            return 1
+        print("已写入开机自启: %s（%s）" % (self.autostart_target(), command))
+        return 0
+
+    def autostart_uninstall(self):
+        import winreg
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_KEY, 0,
+                                 winreg.KEY_SET_VALUE)
+        except OSError:
+            print("未找到开机自启项: %s" % self.autostart_target())
+            return 0
+        try:
+            winreg.DeleteValue(key, APP_ID)
+            print("已移除开机自启: %s" % self.autostart_target())
+        except OSError:
+            print("未找到开机自启项: %s" % self.autostart_target())
+        finally:
+            winreg.CloseKey(key)
+        return 0
+
+
+_BACKEND = None
+
+
+def get_backend():
+    """当前平台的后端（进程内单例）。"""
+    global _BACKEND
+    if _BACKEND is None:
+        _BACKEND = WindowsBackend() if os.name == "nt" else X11Backend()
+    return _BACKEND
+
+
+# --------------------------------------------------------------------------- #
 # 数据层
 # --------------------------------------------------------------------------- #
 def data_dir():
-    """返回数据目录（遵循 XDG_DATA_HOME）。"""
-    base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
-    return os.path.join(base, APP_ID)
+    """返回数据目录（Linux 遵循 XDG_DATA_HOME，Windows 用 %APPDATA%）。"""
+    return get_backend().data_dir()
 
 
 def data_file():
@@ -576,6 +874,7 @@ class TodoWidget(object):
     def __init__(self, root, store, visible=True):
         self.root = root
         self.store = store
+        self.backend = get_backend()
         self.fonts = self._make_fonts()
         self._drag_offset = None          # 拖窗口的偏移
         self._placeholder_on = False
@@ -585,7 +884,6 @@ class TodoWidget(object):
         self._drag_id = None              # 正在被拖动的条目 id
         self._pointer_y = None            # 拖动中指针的屏幕 y（用于贴边自动滚动）
         self._autoscroll_job = None
-        self._ipc_server = None            # 单实例套接字：第二次启动用来把窗口叫到前面
         self._build()
         self._restore_position()
         self._apply_collapsed()
@@ -594,73 +892,17 @@ class TodoWidget(object):
             self.root.deiconify()
             self.root.update_idletasks()
             self._restore_position()      # 映射后再落一次，避免 WM 摆放时挪位
-            self._start_ipc()
-            set_skip_taskbar(self.root)   # 映射后再发一次（KWin 只对已托管的窗口处理这个消息）
+            self.backend.single_instance_start(self.root, self.raise_window)
+            self.backend.set_skip_taskbar(self.root)   # 映射后再补一次（KWin 只对已托管的窗口处理）
 
-    # ---- 单实例：第二次启动 = 把已有窗口叫到最前面 ----
-    def _start_ipc(self):
-        """监听一个 unix 套接字；之后每启动一次本程序，都会让这个窗口浮到前面。"""
-        path = ipc_socket_path()
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            if os.path.exists(path):
-                os.unlink(path)
-            server.bind(path)
-            server.listen(2)
-            server.setblocking(False)
-        except OSError:
-            server.close()
-            return
-        self._ipc_server = server
-        try:
-            self.root.tk.createfilehandler(server, tk.READABLE, self._on_ipc)
-        except (tk.TclError, AttributeError):
-            self._ipc_server = None
-
-    def _on_ipc(self, server, mask):
-        try:
-            connection, _ = server.accept()
-        except OSError:
-            return
-        try:
-            connection.recv(64)
-            connection.sendall(b"ok\n")
-        except OSError:
-            pass
-        finally:
-            connection.close()
-        self.raise_window()
-
+    # ---- 单实例 / 唤回 ----
     def raise_window(self):
-        """把窗口提到最前面并拿到焦点（不改变用户设置的「始终置顶」状态）。"""
-        try:
-            self.root.deiconify()
-            self.root.lift()
-            self.root.attributes("-topmost", True)   # 短暂置顶一下，确保能从别的窗口后面冒出来
-            self.root.focus_force()
-            self.root.after(400, lambda: self.root.attributes(
-                "-topmost", bool(self.store.ui["topmost"])))
-        except tk.TclError:
-            pass
+        """把窗口提到最前面并拿到焦点（不改变用户设置的「始终置顶」状态）。
 
-    def _stop_ipc(self):
-        if self._ipc_server is None:
-            return
-        path = ipc_socket_path()
-        try:
-            self.root.tk.deletefilehandler(self._ipc_server)
-        except (tk.TclError, AttributeError):
-            pass
-        try:
-            self._ipc_server.close()
-        except OSError:
-            pass
-        self._ipc_server = None
-        try:
-            if os.path.exists(path):
-                os.unlink(path)
-        except OSError:
-            pass
+        单实例监听本身在平台后端里：X11 是 unix 套接字 + Tk 文件事件，
+        Windows 是命名互斥体；唤回动作由后端按平台实现。
+        """
+        self.backend.activate_window(self.root, self.store.ui["topmost"])
 
     # ---- 字体 ----
     def _make_fonts(self):
@@ -683,15 +925,16 @@ class TodoWidget(object):
     def _build(self):
         root = self.root
         root.title("桌面待办清单")
-        # 交给 WM 托管（这样点击输入框才能拿到键盘焦点），再用 Motif 提示去掉标题栏。
-        # 窗口类型保持普通，但用 EWMH 的 SKIP_TASKBAR 不在任务栏/dock 里露面；
+        # 窗口交给系统托管（这样点击输入框才能拿到键盘焦点），去标题栏与
+        # 「不进任务栏」都交给平台后端：X11 用 Motif 提示 + EWMH 的 SKIP_TASKBAR，
+        # Windows 用清掉 WS_CAPTION/WS_THICKFRAME + WS_EX_TOOLWINDOW。
         # 被别的窗口盖住后，Alt+Tab 或「再运行一次本程序」都能把它叫回最前面。
         root.withdraw()                          # 先不映射，提示才能在首次建图前生效
         root.attributes("-topmost", bool(self.store.ui["topmost"]))
         root.attributes("-alpha", float(self.store.ui["alpha"]))
-        root.update_idletasks()                  # 促使 Tk 先建出 toplevel 的 WM 窗口
-        strip_window_decorations(root)
-        set_skip_taskbar(root)                   # 任务栏 / dock 里不出现这个图标
+        root.update_idletasks()                  # 促使 Tk 先建出 toplevel 的窗口
+        self.backend.strip_decorations(root)
+        self.backend.set_skip_taskbar(root)      # 任务栏 / dock 里不出现这个图标
         root.configure(bg=C_BORDER)              # 卡片外层留出 1px 边框色
         root.protocol("WM_DELETE_WINDOW", self.quit)
 
@@ -1214,7 +1457,7 @@ class TodoWidget(object):
         except tk.TclError:
             pass
         self._stop_autoscroll()
-        self._stop_ipc()
+        self.backend.single_instance_stop(self.root)
         self.store.save()
         self.root.destroy()
 
@@ -1603,44 +1846,16 @@ def run_doctor():
 
 
 def autostart_path():
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "autostart", "%s.desktop" % APP_ID)
+    """开机自启的落点（Linux: .desktop 文件；Windows: 注册表 Run 键）。"""
+    return get_backend().autostart_target()
 
 
 def install_autostart():
-    script = os.path.abspath(__file__)
-    entry = (
-        "[Desktop Entry]\n"
-        "Type=Application\n"
-        "Name=桌面待办清单\n"
-        "Name[en]=Desktop To-do\n"
-        "Comment=常驻桌面的待办清单挂件\n"
-        "Comment[en]=Always-on-top desktop to-do widget\n"
-        "Exec=%s %s\n"
-        "Icon=checkbox-checked\n"
-        "Terminal=false\n"
-        "Categories=Utility;\n"
-        "StartupNotify=false\n"
-        "X-GNOME-Autostart-enabled=true\n"
-    ) % (sys.executable, script)
-    target = autostart_path()
-    directory = os.path.dirname(target)
-    if not os.path.isdir(directory):
-        os.makedirs(directory)
-    with open(target, "w", encoding="utf-8") as handle:
-        handle.write(entry)
-    print("已写入开机自启: %s" % target)
-    return 0
+    return get_backend().autostart_install()
 
 
 def uninstall_autostart():
-    target = autostart_path()
-    if os.path.exists(target):
-        os.remove(target)
-        print("已移除开机自启: %s" % target)
-    else:
-        print("未找到开机自启项: %s" % target)
-    return 0
+    return get_backend().autostart_uninstall()
 
 
 def main(argv=None):
@@ -1664,7 +1879,9 @@ def main(argv=None):
         print(data_file())
         return 0
 
-    if raise_running_instance():
+    backend = get_backend()
+    backend.prepare_process()      # Windows 的 DPI 感知必须在创建 Tk() 之前声明
+    if backend.raise_running_instance():
         print("桌面待办清单已经在运行，已把它叫到最前面（任务栏里没有它，这是唤回方式）。")
         return 0
 
