@@ -76,6 +76,7 @@ TEXT_X = 36            # 条目文字起始 x（给勾选框留位置）
 DEL_W = 30             # 条目右侧删除按钮的点击区宽度
 ROW_PAD_Y = 6          # 条目上下内边距
 ROW_WRAP = LIST_W - TEXT_X - DEL_W - 4  # 条目文字换行宽度
+UNDO_SECONDS = 8       # 删除后「撤销」保留的秒数
 
 C_CARD = "#24272c"     # 卡片底色
 C_LIST = "#1d2024"     # 输入框 / 列表底色
@@ -654,13 +655,12 @@ class WindowsBackend(PlatformBackend):
         self._mutex = 0
 
     def raise_running_instance(self):
-        """第二个进程自己去找那个窗口并激活，不需要 IPC 服务端。"""
-        handle, existing = win32_instance_mutex("%s-instance" % APP_ID)
-        api = _win_api()
-        if handle and api is not None:
-            api[1].CloseHandle(handle)
-        if not existing:
-            return False
+        """第二个进程自己去找那个窗口并激活，不需要 IPC 服务端。
+
+        判据以「那个窗口还在不在」为准，互斥体只当旁证：2026-10-11 实测到一次
+        第二次启动没认出已有实例、又开出一个窗口（3 次受控复现试验均未再现，根因
+        未确定）。只要「窗口在就唤回」，这类症状就不会再出现。
+        """
         hwnd = win32_find_window(WINDOW_TITLE)
         if not hwnd:
             return False
@@ -891,6 +891,42 @@ class Store(object):
             return True
         return False
 
+    def rename(self, item_id, text):
+        """改条目文字（压掉首尾与多余空白）；空文本不生效。返回是否真的改了。"""
+        cleaned = " ".join(str(text).split())
+        if not cleaned:
+            return False
+        for item in self.items:
+            if item["id"] == item_id:
+                if item["text"] == cleaned:
+                    return False
+                item["text"] = cleaned
+                self.save()
+                return True
+        return False
+
+    def pop(self, item_id):
+        """移除条目，并把 (条目, 原位置) 交出来供撤销用；没找到返回 None。"""
+        for index, item in enumerate(self.items):
+            if item["id"] == item_id:
+                self.items.pop(index)
+                self.save()
+                return {"item": item, "index": index}
+        return None
+
+    def restore(self, record):
+        """把 pop() 出来的条目放回原位置（位置越界就夹到合法范围）。"""
+        if not record or not record.get("item"):
+            return False
+        item = record["item"]
+        for existing in self.items:
+            if existing["id"] == item["id"]:
+                return False              # 已经在列表里，别插重复
+        index = max(0, min(int(record.get("index", 0)), len(self.items)))
+        self.items.insert(index, item)
+        self.save()
+        return True
+
     def clear_done(self):
         before = len(self.items)
         self.items = [item for item in self.items if not item["done"]]
@@ -938,6 +974,11 @@ class TodoWidget(object):
         self._drag_id = None              # 正在被拖动的条目 id
         self._pointer_y = None            # 拖动中指针的屏幕 y（用于贴边自动滚动）
         self._autoscroll_job = None
+        # 撤销与编辑状态
+        self._undo = None                 # 刚删掉的 {item, index}，供撤销放回原位
+        self._undo_job = None             # 撤销时限的 after 句柄
+        self._edit_id = None              # 正在编辑的条目 id
+        self._edit_entry = None           # 正在编辑的输入框（盖在那一行上）
         self._build()
         self._restore_position()
         self._apply_collapsed()
@@ -1070,6 +1111,12 @@ class TodoWidget(object):
         self.footer = foot = tk.Frame(self.card, bg=C_CARD)
         self.hint = tk.Label(foot, text="双击标题可折叠", bg=C_CARD, fg=C_MUTED, font=self.fonts["small"])
         self.hint.pack(side="left")
+        # 「撤销」只在刚删掉一条时出现（见 _show_undo / _clear_undo），平时不占位置
+        self.undo_btn = tk.Label(foot, text="撤销", bg=C_CARD, fg=C_ACCENT,
+                                 font=self.fonts["small"], cursor="hand2")
+        self.undo_btn.bind("<Button-1>", lambda event: self.undo_delete())
+        self.undo_btn.bind("<Enter>", lambda event: self.undo_btn.configure(fg=C_TEXT))
+        self.undo_btn.bind("<Leave>", lambda event: self.undo_btn.configure(fg=C_ACCENT))
         self.clear_btn = tk.Label(foot, text="清除已完成", bg=C_CARD, fg=C_DIM,
                                   font=self.fonts["small"], cursor="hand2")
         self.clear_btn.bind("<Button-1>", lambda event: self.clear_done())
@@ -1192,6 +1239,9 @@ class TodoWidget(object):
 
         for child in list(self.inner.winfo_children()):
             child.destroy()
+        # 行会被重建，正在编辑的输入框随之销毁，别留悬空引用
+        self._edit_id = None
+        self._edit_entry = None
         self.row_widgets = []
         self._press = None
         self._drag_id = None
@@ -1258,6 +1308,7 @@ class TodoWidget(object):
         row.bind("<Button-1>", lambda event, i=item_id: self._row_press(event, i))
         row.bind("<B1-Motion>", self._row_motion)
         row.bind("<ButtonRelease-1>", self._row_release)
+        row.bind("<Double-Button-1>", lambda event, i=item_id: self._begin_edit(i, event))
         row.bind("<Motion>", on_motion)
         row.bind("<Leave>", lambda event: row.itemconfigure(delete_id, fill=C_MUTED))
         self._bind_wheel(row)
@@ -1407,13 +1458,36 @@ class TodoWidget(object):
             self.clear_btn.pack_forget()
 
     def _update_hint(self):
-        """底部提示：折叠时提示展开，条目够多时提示可拖动排序。"""
+        """底部提示：折叠时提示展开，条目够多时提示可拖动排序 / 双击可改。"""
         if self.store.ui["collapsed"]:
-            self.hint.configure(text="双击标题展开")
+            text = "双击标题展开"
         elif len(self.store.items) >= 2:
-            self.hint.configure(text="拖动条目可排序")
+            text = "拖动可排序，双击可改"
         else:
-            self.hint.configure(text="双击标题可折叠")
+            text = "双击标题可折叠"
+        self.hint.configure(text=text, fg=C_MUTED)
+
+    def _show_undo(self, record):
+        """底部临时显示「已删除「…」 + 撤销」，过一会儿自动收起。"""
+        text = record["item"]["text"]
+        limit = 14
+        if len(text) > limit:
+            text = text[:limit] + "…"
+        self.hint.configure(text="已删除「%s」" % text, fg=C_TEXT)
+        self.undo_btn.pack(side="left", padx=(self.px(6), 0))
+        if self._undo_job is not None:
+            try:
+                self.root.after_cancel(self._undo_job)
+            except (tk.TclError, ValueError):
+                pass
+        self._undo_job = self.root.after(int(UNDO_SECONDS * 1000), self._clear_undo)
+
+    def _clear_undo(self):
+        """撤销时限到了：收起按钮、恢复普通提示。"""
+        self._undo_job = None
+        self._undo = None
+        self.undo_btn.pack_forget()
+        self._update_hint()
 
     def _on_inner_configure(self, event=None):
         height = min(self.inner.winfo_reqheight(), self.list_max_h)
@@ -1500,8 +1574,87 @@ class TodoWidget(object):
         self._refresh()
 
     def remove_item(self, item_id):
-        self.store.remove(item_id)
+        """删除一条：先记下它和原位置，底部留 8 秒撤销窗口。"""
+        if self._edit_entry is not None:
+            self._end_edit(save=True)      # 正在编辑就先收好，别改到已经删掉的行
+        record = self.store.pop(item_id)
+        if record is None:
+            return
+        self._undo = record
         self._refresh()
+        self._show_undo(record)
+
+    def undo_delete(self):
+        """把刚删掉的那条放回它原来的位置。"""
+        record, self._undo = self._undo, None
+        if self._undo_job is not None:
+            try:
+                self.root.after_cancel(self._undo_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._undo_job = None
+        self.undo_btn.pack_forget()
+        if record is not None and self.store.restore(record):
+            self._refresh()
+        else:
+            self._update_hint()
+        return record
+
+    # ---- 双击编辑 ----
+    def _find_item(self, item_id):
+        for item in self.store.items:
+            if item["id"] == item_id:
+                return item
+        return None
+
+    def _begin_edit(self, item_id, event=None):
+        """双击条目：在那一行上盖一个输入框；回车保存、Esc 取消、点到别处也算保存。"""
+        if event is not None and event.x >= self.list_w - self.del_w:
+            return                         # 双击落在删除区上，不当编辑
+        if self._edit_entry is not None:
+            self._end_edit(save=True)      # 先收掉上一个
+        widget = self._row_widget(item_id)
+        item = self._find_item(item_id)
+        if widget is None or item is None:
+            return
+        entry = tk.Entry(widget, bg=C_BORDER, fg=C_TEXT, insertbackground=C_TEXT,
+                         relief="flat", bd=0, font=self.fonts["base"],
+                         highlightthickness=0)
+        entry.insert(0, item["text"])
+        entry.select_range(0, "end")
+        height = int(widget.cget("height"))
+        entry.place(x=self.text_x - self.px(2), y=self.px(2),
+                    width=max(self.px(40),
+                              self.list_w - self.text_x - self.del_w - self.px(2)),
+                    height=max(self.px(16), height - 2 * self.px(2)))
+        entry.bind("<Return>", lambda event: self._end_edit(save=True))
+        entry.bind("<Escape>", lambda event: self._end_edit(save=False))
+        entry.bind("<FocusOut>", lambda event: self._end_edit(save=True))
+        self._edit_id = item_id
+        self._edit_entry = entry
+        try:
+            entry.focus_force()
+        except tk.TclError:
+            pass
+
+    def _end_edit(self, save=True):
+        """结束编辑：先把状态摘掉再销毁控件，免得回调打在被销毁的控件上。"""
+        entry, item_id = self._edit_entry, self._edit_id
+        if entry is None:
+            return False
+        self._edit_entry = None
+        self._edit_id = None
+        try:
+            text = entry.get()
+        except tk.TclError:
+            return False
+        try:
+            entry.destroy()
+        except tk.TclError:
+            pass
+        changed = self.store.rename(item_id, text) if save else False
+        self._refresh()
+        return changed
 
     def clear_done(self):
         if self.store.clear_done():
@@ -1601,6 +1754,33 @@ def run_check():
         if [item["text"] for item in Store(path).items] != ["D", "C", "B", "A"]:
             problems.append("排序结果未落盘")
 
+        # 改名 + 删除后撤销：pop() 要交出原位置，restore() 要放回原位
+        editing = Store(path)
+        before_texts = [item["text"] for item in editing.items]
+        keep = editing.add("会被删掉的一条")
+        editing.add("后面的")
+        record = editing.pop(keep["id"])
+        if record is None:
+            problems.append("pop() 没找到条目")
+        elif [item["text"] for item in Store(path).items] != ["后面的"] + before_texts:
+            problems.append("pop() 没有正确移除条目")
+        elif not Store(path).restore(record):
+            problems.append("restore() 没能把条目放回去")
+        elif [item["text"] for item in Store(path).items] != \
+                ["后面的", "会被删掉的一条"] + before_texts:
+            problems.append("撤销删除后位置不对：%r"
+                            % ([item["text"] for item in Store(path).items],))
+        renamed = Store(path)
+        first_item = renamed.items[0]
+        if not renamed.rename(first_item["id"], "  改过的文字  "):
+            problems.append("改名没有生效")
+        elif Store(path).items[0]["text"] != "改过的文字":
+            problems.append("改名未去空白或未落盘")
+        if renamed.rename(first_item["id"], "   "):
+            problems.append("改名不该接受空文本")
+        if Store(path).restore(record):
+            problems.append("restore() 不该把已经在列表里的条目再插一遍")
+
         with open(path, "w", encoding="utf-8") as handle:
             handle.write("{ 这不是 JSON")
         broken = Store(path)
@@ -1627,6 +1807,29 @@ def run_check():
             widget._end_drag()
             if widget._drag_id is not None:
                 problems.append("拖动状态未清理")
+            widget._refresh()
+            # 双击编辑：改完要生效（隐藏窗口下不校验几何）
+            target = broken.items[0]
+            widget._begin_edit(target["id"])
+            if widget._edit_entry is None:
+                problems.append("双击编辑没有进入编辑状态")
+            else:
+                widget._edit_entry.delete(0, "end")
+                widget._edit_entry.insert(0, "界面改名测试")
+                widget._end_edit(save=True)
+                edited = widget._find_item(target["id"])
+                if edited is None or edited["text"] != "界面改名测试":
+                    problems.append("界面改名没有生效")
+            # 删除 + 撤销：要放回原位置
+            order_before = [item["text"] for item in broken.items]
+            victim = broken.items[0]
+            widget.remove_item(victim["id"])
+            if widget._undo is None or any(item["id"] == victim["id"]
+                                           for item in broken.items):
+                problems.append("删除后没有留下撤销记录")
+            widget.undo_delete()
+            if [item["text"] for item in broken.items] != order_before:
+                problems.append("撤销删除后内容或顺序不一致")
             widget._refresh()
             root.update()
             root.withdraw()
