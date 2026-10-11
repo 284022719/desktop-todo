@@ -42,8 +42,12 @@ import sys
 import tempfile
 import time
 
-import tkinter as tk
-from tkinter import font as tkfont
+try:
+    import tkinter as tk
+    from tkinter import font as tkfont
+except ImportError:            # 没装 python3-tk 时，--doctor / --data-file 仍要能跑出信息
+    tk = None
+    tkfont = None
 
 APP_ID = "desktop-todo"
 
@@ -1469,6 +1473,11 @@ def run_check():
     """数据读写与界面构造自检，成功打印 SELFTEST OK 并返回 0。"""
     import tempfile
 
+    if tk is None:
+        sys.stderr.write("自检失败: 缺少 tkinter（统信 UOS / Debian: "
+                         "sudo apt install python3-tk）\n")
+        return 1
+
     problems = []
     temp_dir = tempfile.mkdtemp(prefix="desktop-todo-check-")
     try:
@@ -1745,7 +1754,7 @@ def run_doctor():
     row("env", "窗口后端", get_backend().name)
     row("env", "python", sys.version.split()[0])
     row("env", "脚本路径", os.path.abspath(__file__))
-    row("env", "tk", "Tk %s" % tk.TkVersion)
+    row("env", "tk", "Tk %s" % tk.TkVersion if tk else "缺失（统信 UOS: apt install python3-tk）")
     row("env", "DISPLAY", os.environ.get("DISPLAY") or "(未设置)")
     row("env", "WAYLAND_DISPLAY", os.environ.get("WAYLAND_DISPLAY") or "(未设置)")
     row("env", "XDG_DATA_HOME", os.environ.get("XDG_DATA_HOME") or "(未设置)")
@@ -1788,14 +1797,22 @@ def run_doctor():
 
     # ---- 窗口能力（需要一个隐藏窗口）----
     root = None
-    try:
-        root = tk.Tk()
-        root.title("desktop-todo doctor")
-        root.withdraw()
-        root.update_idletasks()
-    except Exception as error:
-        row("tk", "创建隐藏窗口", "失败：%r" % (error,))
-        caps.append(("Tk 窗口", "FAIL", repr(error)))
+    if tk is None:
+        row("tk", "tkinter", "缺失：界面与窗口能力检查全部跳过")
+        caps.append(("Tk 窗口", "FAIL",
+                     "缺少 tkinter（统信 UOS / Debian: sudo apt install python3-tk）"))
+        caps.append(("去标题栏", "N/A", "缺少 tkinter"))
+        caps.append(("不进任务栏", "N/A", "缺少 tkinter"))
+        caps.append(("中文字体", "N/A", "缺少 tkinter"))
+    else:
+        try:
+            root = tk.Tk()
+            root.title("desktop-todo doctor")
+            root.withdraw()
+            root.update_idletasks()
+        except Exception as error:
+            row("tk", "创建隐藏窗口", "失败：%r" % (error,))
+            caps.append(("Tk 窗口", "FAIL", repr(error)))
 
     if root is not None:
         caps.append(("Tk 窗口", "OK", "Tk %s" % tk.TkVersion))
@@ -1880,6 +1897,11 @@ def main(argv=None):
     if args.data_file:
         print(data_file())
         return 0
+
+    if tk is None:
+        sys.stderr.write("缺少 tkinter，无法启动界面（统信 UOS / Debian: "
+                         "sudo apt install python3-tk）\n")
+        return 1
 
     backend = get_backend()
     backend.prepare_process()      # Windows 的 DPI 感知必须在创建 Tk() 之前声明

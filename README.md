@@ -20,15 +20,18 @@
 
 ## 快速开始
 
-只需要 Python 3 + tkinter（统信 UOS / Deepin 自带；Windows 上随 Python 安装包自带），
-单文件、无第三方依赖。
+只需要 Python 3 + tkinter，单文件、无第三方依赖。
 
 **统信 UOS / Deepin（X11）**：
 
 ```bash
-cd desktop-todo          # 本项目所在目录
+sudo apt install python3-tk      # 统信 UOS 默认不带 tkinter，第一次用要装一次
+cd desktop-todo                  # 本项目所在目录
 python3 desktop_todo.py
 ```
+
+（没装 tkinter 时，`--check` / `--doctor` 会直接告诉你要装 `python3-tk`，
+而不是只抛一句 `No module named 'tkinter'`。）
 
 **Windows 11**：
 
