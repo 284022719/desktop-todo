@@ -109,7 +109,7 @@ python3 desktop_todo.py --doctor
 | 数据目录 | `$XDG_DATA_HOME` 或 `~/.local/share/desktop-todo` | `%APPDATA%\desktop-todo` |
 | 开机自启 | `~/.config/autostart/desktop-todo.desktop` | `HKCU\...\Run`，用 `pythonw.exe` 启动 |
 | 中文字体 | Noto Sans CJK SC / 思源黑体 / 文泉驿微米黑 | Microsoft YaHei UI |
-| 缩放 | 交给 Tk 与桌面环境 | 进程先声明 DPI 感知（必须在创建窗口之前），避免高缩放下模糊 |
+| 缩放 | 读 `tk scaling`（跟随 `Xft.dpi`），像素尺寸按同比例放大 | 先声明进程 DPI 感知，再按 `tk scaling` 同比例放大；100% 时逐像素与旧版相同 |
 | `Alt+Tab` | 仍能找到（故意不发 `SKIP_SWITCHER`） | **找不到**（`WS_EX_TOOLWINDOW` 的代价），靠「再运行一次」唤回 |
 
 ## 实现说明
@@ -118,6 +118,12 @@ python3 desktop_todo.py --doctor
   Deepin 下点击它拿不到键盘焦点，输入框打不了字。这里改成让 WM 托管窗口，
   Linux 用 `_MOTIF_WM_HINTS`、Windows 用窗口样式清掉标题栏——既保持无边框外观，
   又能正常获得焦点、正常被盖住/唤回。
+- **高 DPI / 系统缩放**：字号会随显示器 DPI 放大，窗口尺寸不会，于是 125%/150% 下会
+  「字大框小」（文字挤、列表窄、标题栏发紧）。现在面板宽、内边距、折行宽度、行高、
+  勾选框、图标线条、拖动阈值、窗口位置边距都乘同一个系数，系数取自 Tk 自己算的
+  `tk scaling`——与字号用的是同一套依据，不会出现两套比例打架。缩放为 1.0（96dpi /
+  100%）时这些值**原样返回**，默认观感与旧版逐像素一致；为此 `6.5` 这类半像素值
+  不做取整（`round(6.5)` 会被银行家舍入成 6，反而把勾选框挪 0.5px），这条有测试守着。
 - **不在任务栏 / dock 里显示图标**：窗口类型仍是普通窗口（这样点击能正常拿焦点），
   但按 EWMH 设了 `_NET_WM_STATE_SKIP_TASKBAR` + `SKIP_PAGER`：映射前直接写
   `_NET_WM_STATE` 属性，映射后再补一条标准的 ClientMessage（KWin 只对已托管的

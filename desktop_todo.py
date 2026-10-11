@@ -101,6 +101,43 @@ FONT_STACK = (
 
 
 # --------------------------------------------------------------------------- #
+# 界面缩放（高 DPI / 系统缩放）
+#
+# Tk 的字号单位是「点」，会随显示器 DPI 自动放大；而本程序的窗口尺寸是像素，
+# 不会跟着变。于是 125% / 150% 缩放下会出现「字变大、面板不变」：文字挤、
+# 列表变窄、标题栏发紧。这里用统一的缩放系数把像素尺寸按同样比例放大。
+#
+# 系数取自 Tk 自己算的 tk scaling（X11 依据 Xft.dpi，Windows 依据系统 DPI），
+# 与字号用的是同一套依据，不会出现两套比例打架。缩放为 1.0 时，
+# 下面所有 _scaled() 的返回值都与基准常量逐像素相同——即默认观感一点不变。
+# --------------------------------------------------------------------------- #
+TK_SCALING_AT_96DPI = 96.0 / 72.0     # Tk 的 scaling 就是「每点多少像素」
+
+
+def ui_scale(root):
+    """返回界面缩放系数（1.0 = 96dpi / 100%）。"""
+    try:
+        scaling = float(root.tk.call("tk", "scaling"))
+    except (tk.TclError, ValueError, TypeError, AttributeError):
+        return 1.0
+    if scaling <= 0:
+        return 1.0
+    return max(1.0, min(3.0, scaling / TK_SCALING_AT_96DPI))
+
+
+def _scaled(value, scale):
+    """基准像素值 → 当前缩放下的像素值。
+
+    scale=1.0 时**原样返回**（不改动、也不取整）：像勾选框的 6.5 / 21.5 这种半像素
+    值一旦走 round() 会被银行家舍入（6.5→6、21.5→22），在 100% 缩放下反而比原来
+    偏 0.5~1px，那就违反了「默认观感一点不变」。
+    """
+    if scale == 1.0:
+        return value
+    return int(round(value * scale))
+
+
+# --------------------------------------------------------------------------- #
 # 窗口管理器交互
 # --------------------------------------------------------------------------- #
 def _on_wm_window(root, action):
@@ -879,6 +916,19 @@ class TodoWidget(object):
         self.root = root
         self.store = store
         self.backend = get_backend()
+        # 高 DPI：字号由 Tk 按「点」自动放大，窗口尺寸得按同一比例自己放大
+        self.s = ui_scale(root)
+        self.panel_w = _scaled(PANEL_W, self.s)
+        self.pad = _scaled(PAD, self.s)
+        self.list_w = self.panel_w - 2 * self.pad - 2
+        self.list_max_h = _scaled(LIST_MAX_H, self.s)
+        self.text_x = _scaled(TEXT_X, self.s)
+        self.del_w = _scaled(DEL_W, self.s)
+        self.row_pad_y = _scaled(ROW_PAD_Y, self.s)
+        self.row_wrap = self.list_w - self.text_x - self.del_w - _scaled(4, self.s)
+        self.header_h = _scaled(34, self.s)
+        self.icon_box = _scaled(20, self.s)
+        self.check_box = _scaled(16, self.s)
         self.fonts = self._make_fonts()
         self._drag_offset = None          # 拖窗口的偏移
         self._placeholder_on = False
@@ -952,22 +1002,25 @@ class TodoWidget(object):
         self.menu = self._build_menu()
 
     def _build_header(self):
-        self.header = head = tk.Frame(self.card, bg=C_CARD, height=34)
+        self.header = head = tk.Frame(self.card, bg=C_CARD, height=self.header_h)
         head.pack(fill="x", side="top")
         head.pack_propagate(False)
 
-        dot = tk.Canvas(head, width=10, height=10, bg=C_CARD, highlightthickness=0)
-        dot.create_oval(2, 2, 8, 8, fill=C_ACCENT, outline="")
-        dot.pack(side="left", padx=(PAD, 6))
+        dot_size = self.px(10)
+        dot = tk.Canvas(head, width=dot_size, height=dot_size, bg=C_CARD,
+                        highlightthickness=0)
+        dot.create_oval(self.px(2), self.px(2), self.px(8), self.px(8),
+                        fill=C_ACCENT, outline="")
+        dot.pack(side="left", padx=(self.pad, self.px(6)))
 
         self.title = tk.Label(head, text="待办事项", bg=C_CARD, fg=C_TEXT, font=self.fonts["bold"])
         self.title.pack(side="left")
 
         self.count = tk.Label(head, text="", bg=C_CARD, fg=C_DIM, font=self.fonts["small"])
-        self.count.pack(side="left", padx=(8, 0))
+        self.count.pack(side="left", padx=(self.px(8), 0))
 
         close_btn = self._icon_button(head, "close", self.quit)
-        close_btn.pack(side="right", padx=(0, PAD - 6))
+        close_btn.pack(side="right", padx=(0, max(0, self.pad - self.px(6))))
         self.collapse_btn = self._icon_button(head, "collapse", self.toggle_collapsed)
         self.collapse_btn.pack(side="right")
 
@@ -986,7 +1039,7 @@ class TodoWidget(object):
 
         self.entry = tk.Entry(box, bg=C_LIST, fg=C_TEXT, insertbackground=C_TEXT,
                               relief="flat", bd=0, font=self.fonts["base"], highlightthickness=0)
-        self.entry.pack(side="left", fill="x", expand=True, padx=8, pady=5)
+        self.entry.pack(side="left", fill="x", expand=True, padx=self.px(8), pady=self.px(5))
         self.entry.bind("<Return>", lambda event: self.add_from_entry())
         self.entry.bind("<Escape>", lambda event: self.entry.delete(0, "end"))
         self.entry.bind("<FocusIn>", lambda event: self._clear_placeholder())
@@ -996,7 +1049,7 @@ class TodoWidget(object):
 
         add_btn = tk.Label(row, text="+", bg=C_ACCENT, fg="#ffffff", font=self.fonts["bold"],
                            width=2, cursor="hand2")
-        add_btn.pack(side="left", padx=(6, 0), ipady=5)
+        add_btn.pack(side="left", padx=(self.px(6), 0), ipady=self.px(5))
         add_btn.bind("<Button-1>", lambda event: self.add_from_entry())
         add_btn.bind("<Enter>", lambda event: add_btn.configure(bg="#5aa6ff"))
         add_btn.bind("<Leave>", lambda event: add_btn.configure(bg=C_ACCENT))
@@ -1004,7 +1057,7 @@ class TodoWidget(object):
     def _build_list(self):
         self.list_area = tk.Frame(self.card, bg=C_LIST)
         self.canvas = tk.Canvas(self.list_area, bg=C_LIST, highlightthickness=0, bd=0,
-                                width=PANEL_W - 2 * PAD - 2)
+                                width=self.list_w)
         self.canvas.pack(fill="x", expand=True)
         self.inner = tk.Frame(self.canvas, bg=C_LIST)
         self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
@@ -1040,9 +1093,13 @@ class TodoWidget(object):
         return menu
 
     # ---- 小控件 ----
+    def px(self, value):
+        """基准像素值 → 当前缩放下的像素值（缩放 1.0 时原样返回）。"""
+        return _scaled(value, self.s)
+
     def _icon_button(self, parent, kind, command):
-        canvas = tk.Canvas(parent, width=20, height=20, bg=C_CARD, highlightthickness=0,
-                           cursor="hand2")
+        canvas = tk.Canvas(parent, width=self.icon_box, height=self.icon_box, bg=C_CARD,
+                           highlightthickness=0, cursor="hand2")
         canvas._kind = kind
         self._draw_icon(canvas, kind, C_DIM)
         canvas.bind("<Button-1>", lambda event: command())
@@ -1052,28 +1109,37 @@ class TodoWidget(object):
 
     def _draw_icon(self, canvas, kind, color):
         canvas.delete("all")
+        line_w = 1.6 * self.s
         if kind == "close":
-            canvas.create_line(6, 6, 14, 14, fill=color, width=1.6, capstyle="round")
-            canvas.create_line(14, 6, 6, 14, fill=color, width=1.6, capstyle="round")
+            canvas.create_line(self.px(6), self.px(6), self.px(14), self.px(14),
+                               fill=color, width=line_w, capstyle="round")
+            canvas.create_line(self.px(14), self.px(6), self.px(6), self.px(14),
+                               fill=color, width=line_w, capstyle="round")
         else:  # 折叠箭头：展开时朝下，折叠时朝右
             if self.store.ui["collapsed"]:
-                canvas.create_line(8, 5, 13, 10, 8, 15, fill=color, width=1.6,
+                canvas.create_line(self.px(8), self.px(5), self.px(13), self.px(10),
+                                   self.px(8), self.px(15), fill=color, width=line_w,
                                    capstyle="round", joinstyle="round")
             else:
-                canvas.create_line(5, 8, 10, 13, 15, 8, fill=color, width=1.6,
+                canvas.create_line(self.px(5), self.px(8), self.px(10), self.px(13),
+                                   self.px(15), self.px(8), fill=color, width=line_w,
                                    capstyle="round", joinstyle="round")
 
     def _draw_check(self, canvas, done, top=0):
-        """在 canvas 上画勾选框，top 为垂直偏移。"""
+        """在 canvas 上画勾选框，top 为垂直偏移（尺寸按界面缩放）。"""
         canvas.delete("check")
         y = top
+        box = self.check_box
         if done:
-            canvas.create_rectangle(6, y, 22, y + 16, fill=C_ACCENT, outline="", tags="check")
-            canvas.create_line(10, y + 8, 13, y + 11.5, 18.5, y + 4.5, fill="#ffffff",
-                               width=2, capstyle="round", joinstyle="round", tags="check")
+            canvas.create_rectangle(self.px(6), y, self.px(22), y + box, fill=C_ACCENT,
+                                    outline="", tags="check")
+            canvas.create_line(self.px(10), y + self.px(8), self.px(13), y + self.px(11.5),
+                               self.px(18.5), y + self.px(4.5), fill="#ffffff",
+                               width=2 * self.s, capstyle="round", joinstyle="round",
+                               tags="check")
         else:
-            canvas.create_rectangle(6.5, y + 0.5, 21.5, y + 15.5, outline=C_BORDER,
-                                    width=1.4, tags="check")
+            canvas.create_rectangle(self.px(6.5), y + 0.5, self.px(21.5), y + box - 0.5,
+                                    outline=C_BORDER, width=1.4 * self.s, tags="check")
 
     def _bind_wheel(self, widget):
         widget.bind("<Button-4>", self._on_wheel)
@@ -1081,7 +1147,7 @@ class TodoWidget(object):
         widget.bind("<MouseWheel>", self._on_wheel)
 
     def _on_wheel(self, event):
-        if self.inner.winfo_reqheight() <= LIST_MAX_H:
+        if self.inner.winfo_reqheight() <= self.list_max_h:
             return "break"
         up = getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0
         self.canvas.yview_scroll(-2 if up else 2, "units")
@@ -1135,7 +1201,7 @@ class TodoWidget(object):
         if not self.store.items:
             empty = tk.Label(self.inner, text="暂无待办，在上面输入框添加第一条",
                              bg=C_LIST, fg=C_MUTED, font=self.fonts["small"])
-            empty.pack(fill="x", pady=20)
+            empty.pack(fill="x", pady=self.px(20))
             self._bind_wheel(empty)
         else:
             for item in self.store.items:
@@ -1145,7 +1211,7 @@ class TodoWidget(object):
         self._update_footer()
         self.root.update_idletasks()
         self._resize()
-        if self.inner.winfo_reqheight() > LIST_MAX_H:
+        if self.inner.winfo_reqheight() > self.list_max_h:
             self.canvas.yview_moveto(position)
         else:
             self.canvas.yview_moveto(0.0)
@@ -1167,24 +1233,27 @@ class TodoWidget(object):
     def _make_row(self, item):
         font = self.fonts["done"] if item["done"] else self.fonts["base"]
         line_h = font.metrics("linespace")
-        lines = self._wrap_text(item["text"], font, ROW_WRAP)
-        row_h = line_h * len(lines) + 2 * ROW_PAD_Y
+        lines = self._wrap_text(item["text"], font, self.row_wrap)
+        row_h = line_h * len(lines) + 2 * self.row_pad_y
 
         row = tk.Canvas(self.inner, bg=C_LIST, highlightthickness=0, bd=0,
-                        width=LIST_W, height=row_h, cursor="hand2")
+                        width=self.list_w, height=row_h, cursor="hand2")
         row.pack(fill="x")
 
-        self._draw_check(row, item["done"], top=(row_h - 16) // 2)
+        self._draw_check(row, item["done"], top=(row_h - self.check_box) // 2)
         for index, line in enumerate(lines):
-            row.create_text(TEXT_X, ROW_PAD_Y + index * line_h, text=line, anchor="nw",
+            row.create_text(self.text_x, self.row_pad_y + index * line_h, text=line,
+                            anchor="nw",
                             fill=C_DONE if item["done"] else C_TEXT, font=font)
-        delete_id = row.create_text(LIST_W - 12, row_h // 2 + 1, text="×", anchor="e",
+        delete_id = row.create_text(self.list_w - self.px(12), row_h // 2 + self.px(1),
+                                    text="×", anchor="e",
                                     fill=C_MUTED, font=self.fonts["bold"])
 
         item_id = item["id"]
 
         def on_motion(event):
-            row.itemconfigure(delete_id, fill=C_DANGER if event.x >= LIST_W - DEL_W else C_MUTED)
+            row.itemconfigure(delete_id,
+                              fill=C_DANGER if event.x >= self.list_w - self.del_w else C_MUTED)
 
         row.bind("<Button-1>", lambda event, i=item_id: self._row_press(event, i))
         row.bind("<B1-Motion>", self._row_motion)
@@ -1199,7 +1268,7 @@ class TodoWidget(object):
     def _row_press(self, event, item_id):
         """记住按下的位置：按在右侧 × 上算删除，其余地方先当作可能的点击/拖拽。"""
         self._press = {"id": item_id, "y": event.y_root,
-                       "zone": "delete" if event.x >= LIST_W - DEL_W else "body"}
+                       "zone": "delete" if event.x >= self.list_w - self.del_w else "body"}
 
     def _row_motion(self, event):
         if self._press is None:
@@ -1208,7 +1277,7 @@ class TodoWidget(object):
         if self._drag_id is None:
             if self._press["zone"] != "body":
                 return
-            if abs(event.y_root - self._press["y"]) < 5:
+            if abs(event.y_root - self._press["y"]) < self.px(5):
                 return                       # 还在阈值内，先不进入拖动，避免影响点击
             self._begin_drag(self._press["id"])
         self._drag_to(event.y_root)
@@ -1221,7 +1290,7 @@ class TodoWidget(object):
         if press is None:
             return
         if press["zone"] == "delete":
-            if event.x >= LIST_W - DEL_W:    # 松手时指针仍在 × 上才算删除
+            if event.x >= self.list_w - self.del_w:    # 松手时指针仍在 × 上才算删除
                 self.remove_item(press["id"])
         else:
             self.toggle_item(press["id"])
@@ -1233,9 +1302,9 @@ class TodoWidget(object):
             # 用 Canvas 图元画高亮底 + 左侧强调条：改 Canvas 的 bg 在这里不会重绘
             height = int(widget.cget("height"))
             widget.configure(cursor="fleur")
-            widget.create_rectangle(0, 0, LIST_W, height, fill=C_HOVER, outline="",
+            widget.create_rectangle(0, 0, self.list_w, height, fill=C_HOVER, outline="",
                                     tags="dragbg")
-            widget.create_rectangle(0, 0, 3, height, fill=C_ACCENT, outline="",
+            widget.create_rectangle(0, 0, self.px(3), height, fill=C_ACCENT, outline="",
                                     tags="dragbg")
             widget.tag_lower("dragbg")
         self._start_autoscroll()
@@ -1311,13 +1380,13 @@ class TodoWidget(object):
         self._autoscroll_job = None
         if self._drag_id is None or self._pointer_y is None:
             return
-        if self.inner.winfo_reqheight() > LIST_MAX_H:
+        if self.inner.winfo_reqheight() > self.list_max_h:
             top = self.canvas.winfo_rooty()
             bottom = top + self.canvas.winfo_height()
-            if self._pointer_y < top + 14:
+            if self._pointer_y < top + self.px(14):
                 self.canvas.yview_scroll(-1, "units")
                 self._drag_to(self._pointer_y)
-            elif self._pointer_y > bottom - 14:
+            elif self._pointer_y > bottom - self.px(14):
                 self.canvas.yview_scroll(1, "units")
                 self._drag_to(self._pointer_y)
         self._start_autoscroll()
@@ -1347,7 +1416,7 @@ class TodoWidget(object):
             self.hint.configure(text="双击标题可折叠")
 
     def _on_inner_configure(self, event=None):
-        height = min(self.inner.winfo_reqheight(), LIST_MAX_H)
+        height = min(self.inner.winfo_reqheight(), self.list_max_h)
         if int(self.canvas.cget("height")) != height:
             self.canvas.configure(height=height)
         self.canvas.configure(scrollregion=(0, 0, self.inner.winfo_reqwidth(),
@@ -1360,10 +1429,10 @@ class TodoWidget(object):
     def _resize(self):
         self.card.update_idletasks()
         if self.store.ui["collapsed"]:
-            height = self.header.winfo_reqheight() + 2
+            height = self.header.winfo_reqheight() + self.px(2)
         else:
-            height = self.card.winfo_reqheight() + 2
-        self.root.geometry("%dx%d" % (PANEL_W, height))
+            height = self.card.winfo_reqheight() + self.px(2)
+        self.root.geometry("%dx%d" % (self.panel_w, height))
 
     def _restore_position(self):
         self.root.update_idletasks()
@@ -1372,10 +1441,10 @@ class TodoWidget(object):
         x = self.store.ui["x"]
         y = self.store.ui["y"]
         if x is None or y is None:
-            x = screen_w - PANEL_W - 48
-            y = 96
-        x = max(80 - PANEL_W, min(int(x), screen_w - 80))
-        y = max(0, min(int(y), screen_h - 40))
+            x = screen_w - self.panel_w - self.px(48)
+            y = self.px(96)
+        x = max(self.px(80) - self.panel_w, min(int(x), screen_w - self.px(80)))
+        y = max(0, min(int(y), screen_h - self.px(40)))
         self.root.geometry("+%d+%d" % (x, y))
 
     def _apply_collapsed(self):
@@ -1384,9 +1453,10 @@ class TodoWidget(object):
             self.list_area.pack_forget()
             self.footer.pack_forget()
         else:
-            self.input_row.pack(fill="x", padx=PAD, pady=(2, 8))
-            self.list_area.pack(fill="x", padx=PAD, pady=(0, 8))
-            self.footer.pack(fill="x", padx=PAD, pady=(0, PAD - 4))
+            self.input_row.pack(fill="x", padx=self.pad, pady=(self.px(2), self.px(8)))
+            self.list_area.pack(fill="x", padx=self.pad, pady=(0, self.px(8)))
+            self.footer.pack(fill="x", padx=self.pad,
+                             pady=(0, max(0, self.pad - self.px(4))))
         self._update_hint()
         self._draw_icon(self.collapse_btn, "collapse", C_DIM)
         self._resize()
@@ -1817,7 +1887,11 @@ def run_doctor():
     if root is not None:
         caps.append(("Tk 窗口", "OK", "Tk %s" % tk.TkVersion))
         try:
-            row("scale", "tk scaling", "%.3f" % float(root.tk.call("tk", "scaling")))
+            scaling = float(root.tk.call("tk", "scaling"))
+            factor = ui_scale(root)
+            row("scale", "tk scaling", "%.3f" % scaling)
+            row("scale", "界面缩放", "%.2f 倍（面板宽 %d px）"
+                % (factor, _scaled(PANEL_W, factor)))
         except Exception:
             pass
         try:
