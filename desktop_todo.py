@@ -15,6 +15,7 @@
 
     python3 desktop_todo.py                    # 启动挂件；已在运行则把窗口叫到前面
     python3 desktop_todo.py --check            # 自检（数据读写 + 界面构造）后退出
+    python3 desktop_todo.py --doctor           # 打印环境/窗口能力诊断报告后退出
     python3 desktop_todo.py --install-autostart     # 开机自启
     python3 desktop_todo.py --uninstall-autostart   # 取消开机自启
 
@@ -216,6 +217,167 @@ def set_skip_taskbar(root):
                        ctypes.byref(event))
 
     return _on_wm_window(root, apply)
+
+
+# --------------------------------------------------------------------------- #
+# Win32 助手（纯 ctypes，零第三方依赖；只在 os.name == "nt" 上被调用）
+#
+# 与上面 X11 那套的对应关系：
+#   * winfo_id() 给的是 Tk 的子窗口，真正的顶层窗口要用 GetAncestor(GA_ROOT)
+#     —— 等价于 X11 那边用 XQueryTree 往上找 WM frame；
+#   * 去标题栏 = 清掉 WS_CAPTION | WS_THICKFRAME，窗口仍由系统托管
+#     —— 等价于 _MOTIF_WM_HINTS 的 decorations=0，输入框照样能拿到键盘焦点；
+#   * 不进任务栏 = 加 WS_EX_TOOLWINDOW —— 等价于 EWMH 的 SKIP_TASKBAR
+#     （代价是 Alt+Tab 里也看不到它，所以唤回仍然靠「再运行一次本程序」）。
+# 以上三条已于 2026-10-11 在 Win11 + Python 3.13 实测有效。
+# --------------------------------------------------------------------------- #
+WIN_GWL_STYLE = -16
+WIN_GWL_EXSTYLE = -20
+WIN_WS_CAPTION = 0x00C00000
+WIN_WS_THICKFRAME = 0x00040000
+WIN_WS_EX_TOOLWINDOW = 0x00000080
+WIN_WS_EX_APPWINDOW = 0x00040000
+WIN_SWP_NOSIZE = 0x0001
+WIN_SWP_NOMOVE = 0x0002
+WIN_SWP_NOZORDER = 0x0004
+WIN_SWP_NOACTIVATE = 0x0010
+WIN_SWP_FRAMECHANGED = 0x0020
+WIN_GA_ROOT = 2
+WIN_SW_RESTORE = 9
+WIN_ERROR_ALREADY_EXISTS = 183
+
+
+def _win_api():
+    """加载 user32/kernel32 并声明函数签名；非 Windows 或失败时返回 None。"""
+    if os.name != "nt":
+        return None
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except Exception:
+        return None
+    try:
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.GetAncestor.restype = ctypes.c_void_p
+        user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+        user32.SetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_uint]
+        user32.SetWindowPos.restype = ctypes.c_int
+        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.ShowWindow.restype = ctypes.c_int
+        user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        user32.FindWindowW.restype = ctypes.c_void_p
+        user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        user32.SetForegroundWindow.restype = ctypes.c_int
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+    except Exception:
+        return None
+    return user32, kernel32
+
+
+def win32_top_window(root):
+    """返回 Tk toplevel 对应的顶层窗口句柄；非 Windows / 取不到时返回 0。"""
+    api = _win_api()
+    if api is None:
+        return 0
+    try:
+        return int(api[0].GetAncestor(int(root.winfo_id()), WIN_GA_ROOT) or 0)
+    except Exception:
+        return 0
+
+
+def win32_window_state(root):
+    """读取顶层窗口样式，返回 hwnd/style/exstyle/caption/thickframe/toolwindow/appwindow。"""
+    state = {"hwnd": 0, "style": 0, "exstyle": 0, "caption": False,
+             "thickframe": False, "toolwindow": False, "appwindow": False}
+    api = _win_api()
+    if api is None:
+        return state
+    hwnd = win32_top_window(root)
+    state["hwnd"] = hwnd
+    if not hwnd:
+        return state
+    user32 = api[0]
+    style = int(user32.GetWindowLongW(hwnd, WIN_GWL_STYLE)) & 0xFFFFFFFF
+    exstyle = int(user32.GetWindowLongW(hwnd, WIN_GWL_EXSTYLE)) & 0xFFFFFFFF
+    state["style"] = style
+    state["exstyle"] = exstyle
+    state["caption"] = bool(style & WIN_WS_CAPTION)
+    state["thickframe"] = bool(style & WIN_WS_THICKFRAME)
+    state["toolwindow"] = bool(exstyle & WIN_WS_EX_TOOLWINDOW)
+    state["appwindow"] = bool(exstyle & WIN_WS_EX_APPWINDOW)
+    return state
+
+
+def win32_make_borderless(root):
+    """去标题栏 + 不进任务栏；返回 True 表示 Win32 调用都成功（不保证一定被系统接受）。"""
+    api = _win_api()
+    if api is None:
+        return False
+    user32 = api[0]
+    hwnd = win32_top_window(root)
+    if not hwnd:
+        return False
+    style = int(user32.GetWindowLongW(hwnd, WIN_GWL_STYLE))
+    exstyle = int(user32.GetWindowLongW(hwnd, WIN_GWL_EXSTYLE))
+    user32.SetWindowLongW(hwnd, WIN_GWL_STYLE,
+                          style & ~(WIN_WS_CAPTION | WIN_WS_THICKFRAME))
+    user32.SetWindowLongW(hwnd, WIN_GWL_EXSTYLE,
+                          (exstyle | WIN_WS_EX_TOOLWINDOW) & ~WIN_WS_EX_APPWINDOW)
+    flags = (WIN_SWP_NOMOVE | WIN_SWP_NOSIZE | WIN_SWP_NOZORDER
+             | WIN_SWP_NOACTIVATE | WIN_SWP_FRAMECHANGED)
+    return bool(user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, flags))
+
+
+def win32_activate(root):
+    """把已有窗口叫到最前面（「再运行一次本程序」的唤回动作用它）。"""
+    api = _win_api()
+    if api is None:
+        return False
+    user32 = api[0]
+    hwnd = win32_top_window(root)
+    if not hwnd:
+        return False
+    user32.ShowWindow(hwnd, WIN_SW_RESTORE)
+    return bool(user32.SetForegroundWindow(hwnd))
+
+
+def win32_instance_mutex(name):
+    """返回 (互斥体句柄, 是否已有实例在跑)。句柄交给调用方 CloseHandle。"""
+    api = _win_api()
+    if api is None:
+        return 0, False
+    handle = api[1].CreateMutexW(None, 0, name)
+    return int(handle or 0), ctypes.get_last_error() == WIN_ERROR_ALREADY_EXISTS
+
+
+def win32_set_dpi_aware():
+    """必须在创建 Tk() 之前调用：声明进程 DPI 感知，避免高缩放下的模糊与布局错位。"""
+    if os.name != "nt":
+        return False
+    try:
+        shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        return shcore.SetProcessDpiAwareness(1) == 0
+    except Exception:
+        return False
+
+
+def _win_has_dpi_api():
+    """shcore 的 DPI 感知接口是否可用（只用来报告，不会真的改进程状态）。"""
+    if os.name != "nt":
+        return False
+    try:
+        return hasattr(ctypes.WinDLL("shcore", use_last_error=True),
+                       "SetProcessDpiAwareness")
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -1161,6 +1323,285 @@ def run_check():
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# 诊断（--doctor）
+#
+# 用途：开发机（Windows）写代码、目标机（统信 UOS）跑程序时，把「必须盯着桌面看
+# 一眼」才能确认的事，压成一段可以复制粘贴回来的文本。每个能力都尽量「写进去、
+# 再读回来」验证，而不是「调用没报错就算成功」。
+# 只读：不改数据、不写配置；只额外建一个隐藏窗口做探测。
+# --------------------------------------------------------------------------- #
+def _x11_read_property(x11, display, window, atom, length=8):
+    """读回一个 32 位 X 属性，返回整数列表；读不到返回 []。"""
+    actual_type = ctypes.c_ulong()
+    actual_format = ctypes.c_int()
+    nitems = ctypes.c_ulong()
+    bytes_after = ctypes.c_ulong()
+    prop = ctypes.POINTER(ctypes.c_ulong)()
+    try:
+        status = x11.XGetWindowProperty(
+            ctypes.c_void_p(display), ctypes.c_ulong(window), ctypes.c_ulong(atom),
+            0, length, 0, 0,
+            ctypes.byref(actual_type), ctypes.byref(actual_format),
+            ctypes.byref(nitems), ctypes.byref(bytes_after), ctypes.byref(prop))
+    except Exception:
+        return []
+    if status != 0 or not prop:
+        return []
+    values = []
+    if nitems.value:
+        values = [int(prop[index]) for index in range(int(nitems.value))]
+    try:
+        x11.XFree(prop)
+    except Exception:
+        pass
+    return values
+
+
+def _doctor_x11(root, rows, caps):
+    """X11 侧探测：把 Motif / EWMH 属性真的写进去，再读回来确认。"""
+    seen = {}
+
+    def probe_motif(x11, display, target, root_window):
+        atom = x11.XInternAtom(ctypes.c_void_p(display), b"_MOTIF_WM_HINTS", 0)
+        values = (ctypes.c_ulong * 5)(2, 0, 0, 0, 0)
+        x11.XChangeProperty(ctypes.c_void_p(display), ctypes.c_ulong(target),
+                            ctypes.c_ulong(atom), ctypes.c_ulong(atom), 32, 0,
+                            ctypes.byref(values), 5)
+        seen["target"] = int(target)
+        seen["motif"] = _x11_read_property(x11, display, target, atom)
+
+    def probe_state(x11, display, target, root_window):
+        state_atom = x11.XInternAtom(ctypes.c_void_p(display), b"_NET_WM_STATE", 0)
+        skip_taskbar = x11.XInternAtom(ctypes.c_void_p(display),
+                                       b"_NET_WM_STATE_SKIP_TASKBAR", 0)
+        skip_pager = x11.XInternAtom(ctypes.c_void_p(display),
+                                     b"_NET_WM_STATE_SKIP_PAGER", 0)
+        atoms = (ctypes.c_ulong * 2)(skip_taskbar, skip_pager)
+        x11.XChangeProperty(ctypes.c_void_p(display), ctypes.c_ulong(target),
+                            ctypes.c_ulong(state_atom), ctypes.c_ulong(4), 32, 0,
+                            ctypes.byref(atoms), 2)
+        seen["skip_wanted"] = [int(skip_taskbar), int(skip_pager)]
+        seen["skip_read"] = _x11_read_property(x11, display, target, state_atom)
+
+    if not _on_wm_window(root, probe_motif):
+        rows.append("[x11]   连接不可用：libX11.so.6 缺失 / DISPLAY 无效 / 窗口还没建出来")
+        caps.append(("去标题栏（Motif）", "N/A", "没有可用的 X 连接"))
+        caps.append(("不进任务栏（EWMH）", "N/A", "没有可用的 X 连接"))
+        return
+
+    rows.append("[x11]   WM 顶层窗口 = 0x%x" % seen.get("target", 0))
+    motif = seen.get("motif") or []
+    if len(motif) >= 5 and motif[0] == 2 and motif[2] == 0:
+        rows.append("[x11]   _MOTIF_WM_HINTS 回读 = %r（decorations=0）" % (motif,))
+        caps.append(("去标题栏（Motif）", "OK", "回读确认 decorations=0"))
+    else:
+        rows.append("[x11]   _MOTIF_WM_HINTS 回读 = %r（空或不符合预期）" % (motif,))
+        caps.append(("去标题栏（Motif）", "WARN", "回读 %r" % (motif,)))
+
+    _on_wm_window(root, probe_state)
+    wanted = seen.get("skip_wanted") or []
+    got = seen.get("skip_read") or []
+    if wanted and all(atom in got for atom in wanted):
+        rows.append("[x11]   _NET_WM_STATE 回读含 SKIP_TASKBAR + SKIP_PAGER")
+        caps.append(("不进任务栏（EWMH）", "OK", "SKIP_TASKBAR/SKIP_PAGER 已写入"))
+    else:
+        rows.append("[x11]   _NET_WM_STATE 回读 = %r（期望包含 %r）" % (got, wanted))
+        caps.append(("不进任务栏（EWMH）", "WARN", "回读 %r" % (got,)))
+
+    rows.append("[x11]   映射后 ClientMessage 补发 = %s" % set_skip_taskbar(root))
+    filehandler = hasattr(root.tk, "createfilehandler")
+    rows.append("[x11]   tk.createfilehandler 可用 = %s" % filehandler)
+    caps.append(("单实例唤回（filehandler）", "OK" if filehandler else "WARN",
+                 "unix 套接字 + Tk 文件事件"))
+
+
+def _doctor_win32(root, rows, caps):
+    """Win32 侧探测：在隐藏窗口上真的去边框、加 TOOLWINDOW，再读回样式确认。"""
+    before = win32_window_state(root)
+    if not before["hwnd"]:
+        rows.append("[win]   取不到顶层窗口句柄（GetAncestor 失败）")
+        caps.append(("去标题栏（Win32）", "N/A", "没有 HWND"))
+        caps.append(("不进任务栏（TOOLWINDOW）", "N/A", "没有 HWND"))
+        return
+
+    rows.append("[win]   顶层窗口 = 0x%x，style=0x%08x，exstyle=0x%08x"
+                % (before["hwnd"], before["style"], before["exstyle"]))
+    rows.append("[win]   改之前 caption=%s thickframe=%s toolwindow=%s"
+                % (before["caption"], before["thickframe"], before["toolwindow"]))
+    applied = win32_make_borderless(root)
+    root.update()
+    after = win32_window_state(root)
+    rows.append("[win]   改之后 caption=%s thickframe=%s toolwindow=%s（Win32 调用成功=%s）"
+                % (after["caption"], after["thickframe"], after["toolwindow"], applied))
+
+    removed = applied and not after["caption"] and not after["thickframe"]
+    caps.append(("去标题栏（Win32）", "OK" if removed else "FAIL",
+                 "WS_CAPTION/WS_THICKFRAME 已清除"))
+    caps.append(("不进任务栏（TOOLWINDOW）", "OK" if after["toolwindow"] else "FAIL",
+                 "WS_EX_TOOLWINDOW"))
+
+    found = 0
+    api = _win_api()
+    if api is not None:
+        found = int(api[0].FindWindowW(None, root.title()) or 0)
+    rows.append("[win]   FindWindowW(标题) = 0x%x（命中顶层窗口=%s）"
+                % (found, found == before["hwnd"]))
+    caps.append(("唤回（按标题找窗口）", "OK" if found == before["hwnd"] else "WARN",
+                 "FindWindowW + SetForegroundWindow"))
+    rows.append("[win]   SetForegroundWindow = %s（窗口隐藏时仅供参考）"
+                % win32_activate(root))
+
+    try:
+        dpi = ctypes.WinDLL("user32", use_last_error=True).GetDpiForSystem()
+    except Exception:
+        dpi = 0
+    rows.append("[win]   系统 DPI = %s，DPI 感知 API 可用 = %s（正式版在 Tk() 之前调用）"
+                % (dpi, _win_has_dpi_api()))
+
+
+def _doctor_instance(rows, caps):
+    """单实例与唤回机制的探测：Linux 看 unix 套接字，Windows 看命名互斥体。"""
+    path = ipc_socket_path()
+    if os.name == "nt":
+        handle, exists = win32_instance_mutex("%s-instance" % APP_ID)
+        rows.append("[ipc]   命名互斥体 %s-instance：%s"
+                    % (APP_ID, "已存在（实例在跑）" if exists else "首次创建"))
+        api = _win_api()
+        if handle and api is not None:
+            api[1].CloseHandle(handle)
+        caps.append(("单实例", "OK",
+                     "已有实例在跑（183）" if exists else "首次创建，当前无实例"))
+        rows.append("[ipc]   唤回方式 = 第二个进程 FindWindowW + SetForegroundWindow")
+        return
+
+    rows.append("[ipc]   套接字路径 = %s（已存在=%s）" % (path, os.path.exists(path)))
+    probe = path + ".doctor"
+    try:
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if os.path.exists(probe):
+            os.unlink(probe)
+        server.bind(probe)
+        server.listen(1)
+        server.close()
+        os.unlink(probe)
+        caps.append(("单实例", "OK", "AF_UNIX 可绑定"))
+    except Exception as error:
+        caps.append(("单实例", "FAIL", repr(error)))
+
+
+def run_doctor():
+    """打印一份可粘贴的诊断报告（只读，不改数据/配置）。"""
+    rows, caps = [], []
+
+    def row(section, key, value):
+        rows.append("[%s] %s = %s" % (section, key, value))
+
+    # ---- 环境与路径 ----
+    row("env", "os / sys.platform", "%s / %s" % (os.name, sys.platform))
+    row("env", "python", sys.version.split()[0])
+    row("env", "tk", "Tk %s" % tk.TkVersion)
+    row("env", "DISPLAY", os.environ.get("DISPLAY") or "(未设置)")
+    row("env", "WAYLAND_DISPLAY", os.environ.get("WAYLAND_DISPLAY") or "(未设置)")
+    row("env", "XDG_DATA_HOME", os.environ.get("XDG_DATA_HOME") or "(未设置)")
+    row("env", "XDG_RUNTIME_DIR", os.environ.get("XDG_RUNTIME_DIR") or "(未设置)")
+    row("path", "数据文件", data_file())
+    if os.name == "nt":
+        row("path", "单实例机制", "命名互斥体 %s-instance（Windows 没有 AF_UNIX）" % APP_ID)
+    else:
+        row("path", "单实例套接字", ipc_socket_path())
+    row("path", "开机自启", autostart_path())
+
+    # ---- 数据文件（只读）----
+    path = data_file()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            items = payload.get("items") or []
+            done = len([item for item in items if item.get("done")])
+            row("data", "条目", "%d 条（已完成 %d）" % (len(items), done))
+            caps.append(("数据文件可读", "OK", "%d 条" % len(items)))
+        except Exception as error:
+            row("data", "读取", "失败：%r" % (error,))
+            caps.append(("数据文件可读", "FAIL", repr(error)))
+    else:
+        row("data", "条目", "文件不存在（首次运行会创建）")
+        caps.append(("数据文件可读", "N/A", "还没有数据文件"))
+
+    directory = data_dir()
+    if os.path.isdir(directory):
+        caps.append(("数据目录可写", "OK" if os.access(directory, os.W_OK) else "FAIL",
+                     directory))
+    else:
+        parent = os.path.dirname(directory)
+        caps.append(("数据目录可写", "OK" if os.access(parent, os.W_OK) else "WARN",
+                     "未建，父目录 %s" % parent))
+
+    # ---- 单实例 / 唤回 ----
+    _doctor_instance(rows, caps)
+
+    # ---- 窗口能力（需要一个隐藏窗口）----
+    root = None
+    try:
+        root = tk.Tk()
+        root.title("desktop-todo doctor")
+        root.withdraw()
+        root.update_idletasks()
+    except Exception as error:
+        row("tk", "创建隐藏窗口", "失败：%r" % (error,))
+        caps.append(("Tk 窗口", "FAIL", repr(error)))
+
+    if root is not None:
+        caps.append(("Tk 窗口", "OK", "Tk %s" % tk.TkVersion))
+        try:
+            row("scale", "tk scaling", "%.3f" % float(root.tk.call("tk", "scaling")))
+        except Exception:
+            pass
+        try:
+            if os.name == "nt":
+                _doctor_win32(root, rows, caps)
+            else:
+                _doctor_x11(root, rows, caps)
+        except Exception as error:
+            row("probe", "窗口能力探测", "异常：%r" % (error,))
+        try:
+            families = set(tkfont.families())
+            chosen = None
+            for name in FONT_STACK:
+                if name in families:
+                    chosen = name
+                    break
+            missing = [name for name in FONT_STACK if name not in families]
+            row("font", "命中", chosen or "(都没命中，用 Tk 默认字体)")
+            row("font", "未命中", ", ".join(missing) or "无")
+            caps.append(("中文字体", "OK" if chosen else "WARN", chosen or "回落 Tk 默认"))
+        except Exception as error:
+            row("font", "枚举", "失败：%r" % (error,))
+            caps.append(("中文字体", "FAIL", repr(error)))
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    # ---- 报告 ----
+    print("=" * 68)
+    print("desktop-todo 诊断报告（--doctor）")
+    print("=" * 68)
+    for line in rows:
+        print(line)
+    print("-" * 68)
+    counts = {"OK": 0, "WARN": 0, "FAIL": 0, "N/A": 0}
+    for name, verdict, detail in caps:
+        counts[verdict] = counts.get(verdict, 0) + 1
+        print("%-4s %-26s %s" % (verdict, name, detail))
+    print("-" * 68)
+    print("结论：OK %d / WARN %d / FAIL %d / N/A %d"
+          % (counts["OK"], counts["WARN"], counts["FAIL"], counts["N/A"]))
+    print("DOCTOR DONE")
+    return 0
+
+
 def autostart_path():
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
     return os.path.join(base, "autostart", "%s.desktop" % APP_ID)
@@ -1205,6 +1646,7 @@ def uninstall_autostart():
 def main(argv=None):
     parser = argparse.ArgumentParser(description="桌面待办清单挂件")
     parser.add_argument("--check", action="store_true", help="自检数据读写与界面构造后退出")
+    parser.add_argument("--doctor", action="store_true", help="打印环境/窗口能力诊断报告后退出")
     parser.add_argument("--install-autostart", action="store_true", help="写入 ~/.config/autostart 开机自启")
     parser.add_argument("--uninstall-autostart", action="store_true", help="移除开机自启")
     parser.add_argument("--data-file", action="store_true", help="打印数据文件路径后退出")
@@ -1212,6 +1654,8 @@ def main(argv=None):
 
     if args.check:
         return run_check()
+    if args.doctor:
+        return run_doctor()
     if args.install_autostart:
         return install_autostart()
     if args.uninstall_autostart:
