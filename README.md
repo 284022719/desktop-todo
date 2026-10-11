@@ -146,11 +146,15 @@ python3 desktop_todo.py --doctor
   那需要把 Tk 顶层窗口的 `WndProc` 子类化、再从 C 回调里回到 Python；2026-10-11 实测
   会在 Tk 的 `update()` 内部触发
   `Fatal Python error: PyEval_RestoreThread ... the GIL is released`，直接把进程打崩。
-  改成挂图标时不设 `NIF_MESSAGE`，在 Tk 的定时器里每 120ms 查一次「光标是否落在
-  `Shell_NotifyIconGetRect` 给出的图标矩形内 + 左/右键是不是刚松开」——全程只有 Tk
-  自己的事件循环，没有任何 C→Python 回调。右键菜单直接复用程序自己的菜单
-  （`tk_popup` 弹在鼠标位置）。图标被收进溢出区、当前不可见时查不到矩形，
-  而那时本来也点不到它。
+  改成挂图标时不设 `NIF_MESSAGE`，在 Tk 的定时器里每 40ms 做一次点击判定——全程只有
+  Tk 自己的事件循环，没有任何 C→Python 回调。判定要点两条，都是真机实测出来的：
+  ① 按下之后 `Shell_NotifyIconGetRect` 会返回**另一个**矩形（实测从
+  `(1695,1032,1727,1080)` 变成 `(1631,975,1671,1015)`），所以要在**按下时**锁定这次
+  按压、该键松开即触发，而不是松开时再查一次矩形（那样真实点击永远不成立，而桩测
+  因为把矩形固定住了查不出来）；② 快点击的按下阶段可能整个落在两次轮询之间，所以
+  同时用 `GetAsyncKeyState` 的最低位（"自上次查询以来按过"）兜底。右键菜单直接复用
+  程序自己的菜单（`tk_popup` 弹在鼠标位置）。图标被收进溢出区、当前不可见时查不到
+  矩形，而那时本来也点不到它。
 - **Windows 的窗口句柄**：`winfo_id()` 拿到的是 Tk 的子窗口，真正的顶层窗口要
   `GetAncestor(GA_ROOT)` 再上一层——等价于 X11 那边用 `XQueryTree` 找 WM frame。
 - `topmost` 默认 `false`：只在右键菜单里显式勾选时才会置顶（Linux 走

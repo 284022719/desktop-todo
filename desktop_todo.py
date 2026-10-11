@@ -458,7 +458,7 @@ NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_ICON, NIF_TIP = 0x00000002, 0x00000004
 IDI_APPLICATION = 32512
 TRAY_TIP = "桌面待办清单（左键显示 / 右键菜单）"
-TRAY_POLL_MS = 120                      # 轮询托盘点击的间隔
+TRAY_POLL_MS = 40                       # 轮询托盘点击的间隔（快点击的按下阶段很短，别太稀）
 VK_LBUTTON, VK_RBUTTON = 0x01, 0x02
 
 
@@ -580,16 +580,23 @@ def win32_tray_rect(hwnd):
 
 
 def win32_mouse_buttons():
-    """(左键是否按下, 右键是否按下)：取 GetAsyncKeyState 的高位（当前状态）。"""
+    """(左键按下, 右键按下, 左键刚按过, 右键刚按过)。
+
+    前两项取 GetAsyncKeyState 的高位（当前状态）；后两项取最低位，含义是「自上次查询
+    以来按过」——**快点击的按下阶段可能只有几十毫秒，整个落在两次轮询之间，只看当前
+    状态会漏掉**（2026-10-11 实测漏过一次）。系统允许别的程序把这个位抢先读走，所以
+    它只当补充信号，不当唯一判据。
+    """
     api = _win_api()
     if api is None:
-        return (False, False)
+        return (False, False, False, False)
     user32 = api[0]
     user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
     user32.GetAsyncKeyState.restype = ctypes.c_short
-    left = bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
-    right = bool(user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000)
-    return (left, right)
+    left_state = int(user32.GetAsyncKeyState(VK_LBUTTON))
+    right_state = int(user32.GetAsyncKeyState(VK_RBUTTON))
+    return (bool(left_state & 0x8000), bool(right_state & 0x8000),
+            bool(left_state & 0x0001), bool(right_state & 0x0001))
 
 
 def win32_cursor_pos():
@@ -823,6 +830,7 @@ class WindowsBackend(PlatformBackend):
         self._tray_job = None
         self._tray_left_down = False
         self._tray_right_down = False
+        self._tray_press = None            # 已按在图标上的那个键（等到松开才触发）
         self._tray_menu_open = False
 
     def prepare_process(self):
@@ -897,27 +905,66 @@ class WindowsBackend(PlatformBackend):
         return True
 
     def _tray_poll(self, root, on_activate, on_menu):
-        """一次点击检测：按键由「按下」变「松开」、且光标在图标矩形内，才算点中它。"""
-        left, right = win32_mouse_buttons()
+        """一次点击检测。
+
+        判据分两步，不是只看「松开时在不在图标上」：
+          ① **按下**（当前按下，或"自上次查询以来按过"）时，若光标在图标矩形内，
+             就记下这次按压（`_tray_press`）；
+          ② 该键**松开**时触发，不再重新查矩形。
+        两条实测教训（2026-10-11）：
+          * 按下之后 Shell_NotifyIconGetRect 会返回另一个矩形（实测从
+            (1695,1032,1727,1080) 变成 (1631,975,1671,1015)），所以「松开时再查一次
+            矩形」的判据永远不成立 —— 真实点击点了没反应，而桩测查不出来（桩把矩形
+            固定住了）；
+          * 快点击的按下阶段可能整个落在两次轮询之间（只查"当前是否按下"会漏掉），
+            所以还要用 GetAsyncKeyState 的最低位兜住；那种情况按下与松开都发生在
+            两次轮询之间，直接算一次完成。
+        """
+        left, right, left_recent, right_recent = win32_mouse_buttons()
         was_left, was_right = self._tray_left_down, self._tray_right_down
         self._tray_left_down, self._tray_right_down = left, right
-        if not (was_left or was_right):
+
+        pressed_left = (left and not was_left) or left_recent
+        pressed_right = (right and not was_right) or right_recent
+        if self._tray_press is None and (pressed_left or pressed_right):
+            if self._cursor_on_icon():
+                self._tray_press = "left" if pressed_left else "right"
+                already_up = not left if self._tray_press == "left" else not right
+                if already_up:             # 快点击：按下与松开都没被单独看到
+                    self._fire_tray(self._tray_press, on_activate, on_menu)
+                    return
+
+        if self._tray_press == "left" and was_left and not left:
+            self._fire_tray("left", on_activate, on_menu)
+        elif self._tray_press == "right" and was_right and not right:
+            self._fire_tray("right", on_activate, on_menu)
+
+    def _fire_tray(self, kind, on_activate, on_menu):
+        """执行一次托盘动作（左键唤回 / 右键菜单），并清掉按压状态。"""
+        self._tray_press = None
+        if kind == "left":
+            if os.environ.get("DESKTOP_TODO_VERBOSE"):
+                print("托盘左键 → 唤回窗口", flush=True)
+            on_activate()
             return
+        if self._tray_menu_open:
+            return
+        if os.environ.get("DESKTOP_TODO_VERBOSE"):
+            print("托盘右键 → 弹菜单", flush=True)
+        self._tray_menu_open = True
+        try:
+            on_menu()
+        finally:
+            self._tray_menu_open = False
+
+    def _cursor_on_icon(self):
+        """光标是否落在托盘图标矩形内（图标收进溢出区、查不到矩形时一律 False）。"""
         visible, icon_left, icon_top, icon_right, icon_bottom = \
             win32_tray_rect(self._tray_hwnd)
         if not visible:
-            return
+            return False
         x, y = win32_cursor_pos()
-        if not (icon_left <= x <= icon_right and icon_top <= y <= icon_bottom):
-            return
-        if was_left and not left:
-            on_activate()
-        elif was_right and not right and not self._tray_menu_open:
-            self._tray_menu_open = True
-            try:
-                on_menu()
-            finally:
-                self._tray_menu_open = False
+        return icon_left <= x <= icon_right and icon_top <= y <= icon_bottom
 
     def tray_remove(self, root):
         """摘掉图标并停掉轮询（窗口销毁前调用）。"""
@@ -932,6 +979,7 @@ class WindowsBackend(PlatformBackend):
         self._tray_added = False
         self._tray_left_down = False
         self._tray_right_down = False
+        self._tray_press = None
         self._tray_menu_open = False
 
     def data_dir(self):
@@ -2486,9 +2534,10 @@ def main(argv=None):
     widget = TodoWidget(root, Store(data_file()))
     if os.environ.get("DESKTOP_TODO_VERBOSE"):
         # 默认不输出；排障时设 DESKTOP_TODO_VERBOSE=1 就能看到托盘有没有挂上
-        print("窗口后端 = %s" % get_backend().name)
-        print("托盘图标 = %s" % bool(getattr(widget, "_tray_on", False)))
-        print("数据文件 = %s" % data_file())
+        # （重定向到文件时 stdout 是块缓冲，所以每行都 flush）
+        print("窗口后端 = %s" % get_backend().name, flush=True)
+        print("托盘图标 = %s" % bool(getattr(widget, "_tray_on", False)), flush=True)
+        print("数据文件 = %s" % data_file(), flush=True)
     root.mainloop()
     return 0
 
