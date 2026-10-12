@@ -2707,6 +2707,24 @@ def run_check():
             problems.append("旧格式数据读进来没有按状态归位: %r"
                             % ([item["text"] for item in legacy.items],))
 
+        # ---- 全局快捷键的解析（纯逻辑，两平台共用；真机注册在各自后端里）----
+        hotkey_cases = {"Super+T": (0x40, "t"), "ctrl+alt+k": (0x0C, "k"),
+                        "F5": (0x00, "F5"), "Shift+Space": (0x01, "space")}
+        for spec, expect in hotkey_cases.items():
+            if parse_hotkey(spec) != expect:
+                problems.append("快捷键解析不对: %r → %r（期望 %r）"
+                                % (spec, parse_hotkey(spec), expect))
+        for bad in ("", "Ctrl", "Ctrl++", "Ctrl+Alt", "Foo+Bar",
+                    "Ctrl+Alt+Shift+Meta+1+2", "中"):
+            if parse_hotkey(bad) is not None:
+                problems.append("认不出的快捷键应当返回 None: %r → %r"
+                                % (bad, parse_hotkey(bad)))
+        if format_hotkey("super+t") != "Super+T" or format_hotkey("ctrl+alt+k") != "Ctrl+Alt+K":
+            problems.append("快捷键格式化不对: %r / %r"
+                            % (format_hotkey("super+t"), format_hotkey("ctrl+alt+k")))
+        if parse_hotkey("Super+T") != parse_hotkey("super-t"):
+            problems.append("快捷键对大小写和连字符应当等价")
+
         # ---- 默认排序：未完成 → 等待中 → 已完成（同组内保持手动顺序）----
         order = Store(os.path.join(temp_dir, "order.json"))
         a = order.add("A")            # 顺序：A B C D（新增插到最前）
@@ -3377,7 +3395,12 @@ def main(argv=None):
         store = Store(data_file())
         store.ui["hotkey"] = args.hotkey
         store.save()
-        print("全局唤回快捷键 = %s（下次启动生效；冲突了可以换一个）" % format_hotkey(args.hotkey))
+        if os.name == "nt":
+            print("全局唤回快捷键 = %s（Windows 后端还没实现全局快捷键，这里只是把这个值记下来；"
+                  "Windows 上用托盘图标唤回）" % format_hotkey(args.hotkey))
+        else:
+            print("全局唤回快捷键 = %s（下次启动生效；冲突了可以换一个）"
+                  % format_hotkey(args.hotkey))
         return 0
 
     if tk is None:

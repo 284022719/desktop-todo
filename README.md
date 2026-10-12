@@ -295,6 +295,31 @@ Terminal=false
 Categories=Utility;
 ```
 
+## 开发与验证：两台机器怎么分工
+
+同一份文件在两个平台跑，所以**共享逻辑**在哪台机器上改都一样；**平台专属行为只能在对应平台上验证**。
+（这条约定是按实际踩坑定的：Windows 托盘的 `Fatal Python error` 只在 Win11 真机上暴露，
+而「dde-dock 不画第三方托盘项」「startdde 会删自启项」这两件事只能在 Deepin 真机上试出来。）
+
+| 改动内容 | 在哪改 | 在哪验 |
+| --- | --- | --- |
+| 数据格式、三态与默认排序、界面渲染与拖拽、自检 / `--doctor` 逻辑、快捷键解析 | 任一台都行 | 两台都能跑 `--check` 兜底 |
+| Windows 专属：`Shell_NotifyIcon` 托盘、高 DPI 声明、`pythonw` 无黑框、`WS_EX_TOOLWINDOW` | 需要 Windows 环境 | **Windows 11**：`python desktop_todo.py --doctor` 会把窗口样式、DPI、托盘能力的**回读**结果打出来 |
+| Linux 专属：`_MOTIF_WM_HINTS`、`SKIP_TASKBAR`、`XGrabKey` 全局快捷键、开机自启（startdde 会删条目）、dde-dock 托盘行为 | 需要 X11 环境 | **统信 UOS / Deepin**：`python3 desktop_todo.py --doctor` |
+
+两条纪律：
+
+1. 每段工作结束 **commit + push**；下次动手前先 `git fetch`。两台机器是各自独立的克隆，
+   不 push 对方就看不到改动。
+2. 程序**重启后才加载新代码**（开机自启指向脚本所在目录，重登或手动重启即可）。
+   在 Linux 上重启还会顺手把「默认排序」写回数据文件。
+
+`--check` 两个平台都能跑：它只走数据读写、界面构造、拖拽 / 排序 / 三态、快捷键解析这些
+代码路径；窗口外观那两步各走各的后端（Windows 改窗口样式、Linux 写 X11 提示），
+但不需要托盘、自启动、全局快捷键这些真机能力。所以它挡得住大部分手误；
+**"这台机器上到底生没生效"仍然交给 `--doctor`** —— 它每一项都是写进去再回读，
+不是"调用没报错就算成功"。
+
 ## 许可证
 
 MIT License，见 [LICENSE](LICENSE)。
