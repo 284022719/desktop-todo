@@ -1,0 +1,187 @@
+# 交接文档：桌面待办清单（desktop-todo）
+
+> 这是**会话交接**：某一段开发做了什么、为什么这么做、现在是什么状态、下一步注意什么。
+> 目标读者是"下一个接手的人/AI 会话"（很可能是家里 Windows 那台，或这台工作机上的新会话）。
+>
+> - 仓库：<https://github.com/284022719/desktop-todo>（公开，分支 `main`，SSH 推送）
+> - 覆盖时段：**2026-10-12**（Linux / Deepin 23 工作机这一侧）
+> - 起点 `db95f6e`（Windows 托盘点击修正）→ **终点 `bfe34b6`**
+> - 产物：单文件 `desktop_todo.py`（约 3400 行）+ `README.md` + 两张预览图；本会话 4 个文件、+1224 / −84 行
+
+---
+
+## 0. 一句话现状
+
+Linux/Deepin 侧的功能这一轮补齐了：**三态（未完成 / 等待中 / 已完成）+ 默认分段排序 + 全局快捷键唤回 + 开机自启（含 startdde 的坑）+ 窗口可改大小并记住尺寸**。
+Deepin 的托盘图标这条路**已确认走不通**（三条路都试到底，见 §3.1），改用一个全局快捷键解决"唤回"这个真实需求。
+
+---
+
+## 1. 项目与两台机器
+
+| | 工作机（本文档所在） | 家里那台 |
+| --- | --- | --- |
+| 系统 | Deepin 23 / X11 / KWin，1920×1080 | Windows 11（Python 3.13） |
+| 角色 | **目标平台**；平台专属行为在这里验 | Windows 专属行为在那里验；共享逻辑也可在那儿写 |
+| 脚本 | `/home/haier/dsh/desktop-todo/desktop_todo.py`（另一个克隆在 Windows 上） | 同一份文件 |
+| 数据 | `~/.local/share/desktop-todo/todos.json` | `%APPDATA%\desktop-todo\todos.json` |
+| 自启 | `~/.config/autostart/desktop-todo.desktop` **＋** `~/.local/share/applications/desktop-todo.desktop`（见 §3.2） | `HKCU\...\Run`，用 `pythonw.exe` |
+| 唤回 | 全局快捷键 `Super+T`（`--hotkey` 可改）／再运行一次／应用菜单 | 右下托盘图标（左键唤回、右键菜单） |
+| 依赖 | Python 3 + tkinter + `libX11.so.6`（ctypes），零第三方包 | Python 3 + tkinter |
+
+**开发与验证分工**（README 里也有同一张表）：共享逻辑哪台机器都行，靠 `--check` 兜底；
+平台专属行为只能在对应平台验，靠 `--doctor` 回读结果。**每段工作结束 push，下次动手前 fetch。**
+
+---
+
+## 2. 本会话的提交（8 个，按时间）
+
+| 提交 | 内容 | 关键点 |
+| --- | --- | --- |
+| `144a3d1` | 修双击改文字 | 勾选以前会整表重建行 → Tk 判定双击要求两次点击在同一控件上，**永远进不了编辑**。改成只重画那一行（`_draw_row` / `_redraw_row`），自检用"行控件对象同一性"卡住这条 |
+| `ca30f61` | 开机自启 | Deepin 上只写 autostart 会被 `startdde` 删掉；要**同时**写 `~/.local/share/applications/<app-id>.desktop`（见 §3.2） |
+| `412c90f` | 三态 + 全局快捷键 | `state: todo/waiting/done`（同时写 `done` 保持兼容）；`XGrabKey` 抓根窗口 + 120ms 轮询；自检新增多处覆盖 |
+| `9c392a6` | doctor 措辞 | "快捷键没注册上"最常见的原因就是**自己的实例正占着它** |
+| `da366bf` | README 截图 | 三态预览图 |
+| `7dc4968` | 默认排序 | 未完成 → 等待中 → 已完成；稳定排序保留段内手拖顺序；**延迟 1.2 秒归位**（见 §3.3） |
+| `a00ab4e` | Windows 开发分工 | 自检补快捷键解析用例；`--hotkey` 在 Windows 上说实话；README 新增分工表 |
+| `bfe34b6` | 窗口可改大小 | 宽度自适应重排、拉高多显示、尺寸写进 `ui.width/height` |
+
+新增的主要代码：`X11Hotkey`（含 `parse_hotkey` / `format_hotkey`）、`Store.resort/toggle_waiting/state_of`、
+`TodoWidget._apply_metrics/_list_space/_on_root_configure/_apply_resize/_apply_saved_size/_draw_wait_icon`、
+`X11Backend.hotkey_*` / `app_entry_target` / `_desktop_entry`。
+
+---
+
+## 3. 重要结论（别再重复试）
+
+### 3.1 Deepin 23（dde-dock 5.10.16）上，第三方托盘图标**显示不了**
+
+三条路都试到底，证据都在提交说明/本会话记录里：
+
+1. **自己实现 SNI（StatusNotifierItem，纯 dbus）**：注册成功、托盘管理器逐个读走 13 个属性，
+   **dock 不画**。
+2. **GTK 的 `GtkStatusIcon`（能显示的 `xfce4-notes` 用的同一个 API）**：图标窗口进了
+   `com.deepin.dde.TrayManager` 的 `TrayIcons`，X 属性与 `xfce4-notes` **逐字段一致**
+   （16×16、`IsViewable`、`_XEMBED_INFO=0x1,0x1`、`_NET_WM_PID` 都在），GTK 自己也报 `embedded=True`
+   —— **dock 依然不画**，它从没为这个项建过 `XEmbedTrayWidget`。
+   （踩坑：客户端必须有一个**真实窗口**，哪怕是个藏在屏幕外的小窗；只有裸图标窗口时 daemon 会
+   Add 完立刻 remove。）
+3. **dock 的"持有列表"**：dconf `[dde/dock] plugin-settings` → `tray.holded_window:<名字>=true`
+   才是显示的必要条件（`xfce4-notes` 是 true、微信是 false）。往里写 `desktop-todo`、
+   调 dock 的 `ReloadPlugins()`、甚至**重启整个 dock** —— 还是不画。
+
+**结论**：这一版 dock 只画它自己认可的托盘项，第三方注册得再规范也没用。
+所以 Linux 侧的"唤回"用**全局快捷键**实现（§2 `412c90f`）。如果哪天升到别的桌面环境，
+可以再花几十行试试"GTK 小进程 + `GtkStatusIcon`"这条路（协议侧已证明可行）。
+
+### 3.2 `startdde` 会删掉"解析不出应用 id"的自启项
+
+- 现象：只写 `~/.config/autostart/desktop-todo.desktop`，**约 30 秒后文件消失**；
+  journal 里只有一句 `startmanager.go: RemoveAutostart failed: failed to get app id`。
+- 规矩：自启项的 app id（= 文件名）要能解析到**已安装的应用**，所以安装时同时写
+  `~/.local/share/applications/desktop-todo.desktop`（带 `X-Deepin-AppID`、`StartupWMClass`），
+  脚本的 `wm class` 也用 `desktop-todo`。
+- 验证方式：**装完盯 30 秒以上**（`--doctor` 里也有一条"自启项 + 应用条目是否配套"的检查）。
+
+### 3.3 Tk 的两个"顺序陷阱"
+
+- **双击**：`<Double-Button-1>` 要求两次点击落在同一个控件上。所以任何"点一下就重建/挪走整行"
+  的行为都会让双击改名失效。
+- **默认排序**：勾选/标记等待后**不立刻**把行挪到别的段，而是 `REGROUP_DELAY_MS=1200` 之后
+  再归位（拖动中、编辑中顺延）。想换段只能点勾选框或小钟；拖拽落点被 `_clamp_to_group()`
+  夹在本段内。这几条都有自检用例，别顺手"优化"掉。
+
+---
+
+## 4. 当前机器状态（2026-10-12 写文档这一刻的快照）
+
+- 挂件在跑：pid 见 `ps -eo pid,cmd | grep desktop_todo.py`；窗口 **362×512 @ (1569,15)**（尺寸被记住）。
+- 数据：`todos.json` 12 条（未完成 10 / 等待中 1 / 已完成 1）—— 用户随时会改，别拿这个数字当断言。
+- `--doctor`：`OK 9 / WARN 1 / FAIL 0`。**那条 WARN 是正常的**：挂件在跑，`Super+T` 被它自己占着，
+  第二个进程自然抓不到。
+- 自启：两个 `.desktop` 都在。
+- 快捷键：`Super+T`（`ui.hotkey` 已记录）。
+- 关键常量（改布局/时常常用）：`PANEL_W=300`、`PAD=12`、`LIST_MAX_H=268`、`TEXT_X=36`、
+  `DEL_W=30`、`WAIT_W=30`、`ROW_PAD_Y=6`、`DOUBLE_CLICK_REVERT_S=0.8`、
+  `REGROUP_DELAY_MS=1200`、`X11Hotkey.POLL_MS=120`、`TRAY_POLL_MS=40`（Windows）。
+
+---
+
+## 5. 怎么验（可复现的配方）
+
+```bash
+cd /home/haier/dsh/desktop-todo
+python3 desktop_todo.py --check     # 跨平台自检：数据/界面/拖拽/排序/三态/快捷键解析。提交前必跑
+python3 desktop_todo.py --doctor    # 环境与平台能力，每项都是"写进去再回读"
+```
+
+**隔离实例**（测试一律别碰真实数据 `/home/haier/.local/share/desktop-todo`）：
+
+```bash
+rm -rf /tmp/t && mkdir -p /tmp/t/data /tmp/t/run && chmod 700 /tmp/t/run
+# 需要的话先写一份测试数据到 /tmp/t/data/desktop-todo/todos.json
+XDG_DATA_HOME=/tmp/t/data XDG_RUNTIME_DIR=/tmp/t/run DESKTOP_TODO_VERBOSE=1 \
+  setsid nohup python3 desktop_todo.py > /tmp/t/log 2>&1 &
+xdotool search --class desktop-todo   # 会列出多个窗口：按位置/尺寸挑出测试实例，别用 head -1
+```
+
+**快捷键 A/B**（严格的证法：先让焦点在别的窗口上，再按键）：
+
+```bash
+other=$(xdotool getactivewindow)         # 或者随便点一个别的窗口
+xdotool windowactivate "$other"; sleep 1
+xdotool getwindowfocus                   # 负对照：应仍是 other
+xdotool key super+t; sleep 1
+xdotool getwindowfocus                   # 应变成挂件窗口
+```
+
+**改大小**：`xdotool windowsize <win> 480 620` → 截图看右侧图标是否移到新宽度边缘、
+可见行数是否变多；`xdotool windowclose <win>` 再重启，看尺寸是否被记住。
+
+**给自检加新用例之后，顺手做"反例测试"**：把实现改坏（比如让 `resort()` 不排序、
+让 `_apply_metrics()` 忽略宽度），确认 `--check` 会失败、并打印出对得上的那句话。
+
+---
+
+## 6. 已知小瑕疵 / 明确没做的
+
+1. 启动时窗口位置可能有 **±10px 漂移**（KWin 摆放 + 先设位置后套尺寸的顺序）。
+2. 比设计尺寸更小的窗口**不做归一化**（"只增不减"是有意的）：想缩回 300px 宽得手动拉。
+3. 折叠模式与改大小的交互**没专门验过**。
+4. "拖拽不跨段"是**有意设计**（换段请点勾选框/小钟）。如果想要"拖进已完成区就标记完成"，
+   那是一个新功能，不是 bug。
+5. Linux 托盘：不做（§3.1）。
+6. Windows 专属代码（`Shell_NotifyIcon` 托盘、DPI 声明、`pythonw`、`WS_EX_TOOLWINDOW`）
+   本会话**一行没动**，但**自 10-11 之后没在 Windows 上重跑过**，回家建议先跑一遍
+   `python desktop_todo.py --check` + `--doctor` 并点一次托盘确认。
+
+---
+
+## 7. 下一步建议（按优先级）
+
+1. **回家在 Windows 上验一遍**：`--check`（共享逻辑）+ `--doctor`（窗口样式/DPI/托盘回读）+ 点托盘唤回。
+   注意 Windows 侧**没有**全局快捷键（`--hotkey` 只会把值记下来）。
+2. 若要继续打磨 Linux 侧（都在这一台机器能验）：
+   - 折叠时的标题顺便显示「N 等待」；
+   - 「等待中」的筛选/一键折叠成一组；
+   - 窗口位置漂移（§6.1）与"缩回设计尺寸"的支持。
+3. 若换到别的桌面环境（比如 Deepin 25 / GNOME / KDE），可以重试托盘（§3.1 给了成本估计）。
+
+---
+
+## 8. 工作纪律（都是踩过的坑换来的）
+
+- **提交前跑 `--check`**；给自检加了新用例就做反例测试，别写"永远为真"的断言。
+- **不要动用户的真实数据**：测试一律用隔离的 `XDG_DATA_HOME` / `XDG_RUNTIME_DIR`。
+- **合成点击前先确认指针下是哪个窗口**：
+  `xdotool mousemove X Y; xdotool getmouselocation --shell`，看到 `WINDOW=` 是测试窗口再点。
+  （本会话有一次误点：有别的窗口全屏盖着，点击落进了用户的聊天窗口。没造成改动，但很险。）
+- **杀进程按进程名**（`ps -eo pid,comm | awk '$2=="python3"…'` 再 `kill`），
+  别用 `pkill -f "python3 xxx.py"` —— 它会匹配到你自己那条 `bash -c`，把自己也杀了。
+- 排障时用 `python3 -u` / `DESKTOP_TODO_VERBOSE=1`：重定向到文件时 stdout 是块缓冲，
+  被缓冲掉的 traceback 会让人白查半天。
+- 断言要有**真机证据**：像素 diff（`compare -metric AE`）、`xprop` 回读、真实点击、
+  存档 JSON 对照。代码"看起来对"不算。
+- 改完代码**程序要重启才生效**（自启指向脚本所在目录）；在 Linux 上重启还会顺手把
+  默认排序写回数据文件。
