@@ -1404,7 +1404,8 @@ class Store(object):
         # topmost 默认关闭：不置顶，就不会一直挡在其他窗口前面。
         # 需要时在右键菜单里勾「始终置顶」，勾选状态会被记住。
         self.ui = {"x": None, "y": None, "collapsed": False, "alpha": 0.94,
-                   "topmost": False, "hotkey": HOTKEY_DEFAULT}
+                   "topmost": False, "hotkey": HOTKEY_DEFAULT,
+                   "width": None, "height": None}
         self._next_id = 1
         self.load()
 
@@ -1464,6 +1465,10 @@ class Store(object):
             hotkey = ui.get("hotkey")
             if isinstance(hotkey, str) and parse_hotkey(hotkey) is not None:
                 self.ui["hotkey"] = hotkey
+            for key in ("width", "height"):
+                value = ui.get(key)
+                if isinstance(value, (int, float)) and 80 <= float(value) <= 10000:
+                    self.ui[key] = int(value)
             alpha = ui.get("alpha")
             if isinstance(alpha, (int, float)) and 0.3 <= float(alpha) <= 1.0:
                 self.ui["alpha"] = float(alpha)
@@ -1640,24 +1645,106 @@ class TodoWidget(object):
 
     REGROUP_DELAY_MS = 1200       # 状态变了多久之后把它归位（留出双击改名的窗口）
 
+    def _apply_metrics(self, width=None):
+        """按给定宽度（缺省用设计宽度）重算所有跟尺寸有关的量。
+
+        正常启动算出来的数与老实现逐像素一致（这些值都能被自检卡住）；
+        窗口被拉大之后才跟着变宽 —— 换行宽度、右侧图标位置都会跟着变。
+        """
+        scale = self.s
+        panel_w = _scaled(PANEL_W, scale)
+        if width:
+            panel_w = max(panel_w, int(width))
+        self.panel_w = panel_w
+        self.pad = _scaled(PAD, scale)
+        self.list_w = max(1, self.panel_w - 2 * self.pad - 2)
+        self.list_max_h = _scaled(LIST_MAX_H, scale)
+        self.text_x = _scaled(TEXT_X, scale)
+        self.del_w = _scaled(DEL_W, scale)
+        self.wait_w = _scaled(WAIT_W, scale)
+        self.row_pad_y = _scaled(ROW_PAD_Y, scale)
+        self.row_wrap = max(_scaled(40, scale),
+                            self.list_w - self.text_x - self.del_w - self.wait_w
+                            - _scaled(4, scale))
+        self.header_h = _scaled(34, scale)
+        self.icon_box = _scaled(20, scale)
+        self.check_box = _scaled(16, scale)
+
+    def _list_space(self, height=None):
+        """当前窗口高度里最多能给列表多少像素（多出来的高度就多显示几条）。"""
+        try:
+            if height is None:
+                height = self.root.winfo_height()
+            # 卡片高度减去列表高度 = 标题 + 输入框 + 底部 + 间距
+            chrome = self.card.winfo_reqheight() - self.list_area.winfo_reqheight()
+        except (tk.TclError, AttributeError):
+            return _scaled(LIST_MAX_H, self.s)
+        return max(0, int(height) - int(chrome) - self.px(4))
+
+    def _on_root_configure(self, event):
+        """窗口被拉大 / 拉高（WM 边缘拖拽）：防抖之后按新尺寸重排。"""
+        if event.widget is not self.root:
+            return
+        if self._size_job is not None:
+            try:
+                self.root.after_cancel(self._size_job)
+            except (tk.TclError, ValueError):
+                pass
+        try:
+            self._size_job = self.root.after(160, self._apply_resize)
+        except tk.TclError:
+            self._size_job = None
+
+    def _apply_resize(self):
+        """按窗口现在的尺寸重排列宽与列表高度；没变化就不重画（避免来回震荡）。"""
+        self._size_job = None
+        try:
+            width, height = self.root.winfo_width(), self.root.winfo_height()
+        except tk.TclError:
+            return
+        if width <= 1 or height <= 1:
+            return
+        before = (self.panel_w, self.list_max_h)
+        self._apply_metrics(width)
+        space = self._list_space(height)
+        if space > self.list_max_h:
+            self.list_max_h = space
+        if (self.panel_w, self.list_max_h) == before:
+            return
+        self._user_sized = True
+        self.store.ui["width"] = self.panel_w
+        self.store.ui["height"] = height
+        self.store.save()
+        self._refresh()
+
+    def _apply_saved_size(self):
+        """启动时把上次的窗口尺寸装回来（宽度影响排版，高度决定列表能显示几条）。"""
+        width = self.store.ui.get("width")
+        height = self.store.ui.get("height")
+        if not width and not height:
+            return
+        self._apply_metrics(width)
+        if height:
+            self.list_max_h = max(self.list_max_h, self._list_space(height))
+        self._user_sized = True
+        try:                              # 把上次的尺寸真正装回窗口（宽 + 高）
+            self.root.geometry("%dx%d" % (self.panel_w, int(height or self.root.winfo_height())))
+        except tk.TclError:
+            pass
+
     def __init__(self, root, store, visible=True):
         self.root = root
         self.store = store
         self.backend = get_backend()
         # 高 DPI：字号由 Tk 按「点」自动放大，窗口尺寸得按同一比例自己放大
         self.s = ui_scale(root)
-        self.panel_w = _scaled(PANEL_W, self.s)
-        self.pad = _scaled(PAD, self.s)
-        self.list_w = self.panel_w - 2 * self.pad - 2
-        self.list_max_h = _scaled(LIST_MAX_H, self.s)
-        self.text_x = _scaled(TEXT_X, self.s)
-        self.del_w = _scaled(DEL_W, self.s)
-        self.wait_w = _scaled(WAIT_W, self.s)
-        self.row_pad_y = _scaled(ROW_PAD_Y, self.s)
-        self.row_wrap = self.list_w - self.text_x - self.del_w - self.wait_w - _scaled(4, self.s)
-        self.header_h = _scaled(34, self.s)
-        self.icon_box = _scaled(20, self.s)
-        self.check_box = _scaled(16, self.s)
+        # 尺寸相关的量都走 _apply_metrics()：窗口被拉大/拉高之后要能跟着重排
+        self.panel_w = self.pad = self.list_w = self.list_max_h = 0
+        self.text_x = self.del_w = self.wait_w = self.row_pad_y = self.row_wrap = 0
+        self.header_h = self.icon_box = self.check_box = 0
+        self._size_job = None             # 尺寸变化的重排任务（防抖）
+        self._user_sized = False          # 用户手动改过大小：之后不再把它缩回去
+        self._apply_metrics(store.ui.get("width"))
         self.fonts = self._make_fonts()
         self._drag_offset = None          # 拖窗口的偏移
         self._placeholder_on = False
@@ -1825,6 +1912,7 @@ class TodoWidget(object):
         self.canvas.pack(fill="x", expand=True)
         self.inner = tk.Frame(self.canvas, bg=C_LIST)
         self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.root.bind("<Configure>", self._on_root_configure)
         self.inner.bind("<Configure>", self._on_inner_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self._bind_wheel(self.canvas)
@@ -2363,10 +2451,19 @@ class TodoWidget(object):
             height = self.header.winfo_reqheight() + self.px(2)
         else:
             height = self.card.winfo_reqheight() + self.px(2)
-        self.root.geometry("%dx%d" % (self.panel_w, height))
+        width = self.panel_w
+        if self._user_sized:
+            # 用户自己拉过大小：只增不减，别把他的窗口缩回去
+            try:
+                width = max(width, self.root.winfo_width())
+                height = max(height, self.root.winfo_height())
+            except tk.TclError:
+                pass
+        self.root.geometry("%dx%d" % (width, height))
 
     def _restore_position(self):
         self.root.update_idletasks()
+        self._apply_saved_size()
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
         x = self.store.ui["x"]
@@ -2408,6 +2505,9 @@ class TodoWidget(object):
         self._drag_offset = None
         self.store.ui["x"] = self.root.winfo_x()
         self.store.ui["y"] = self.root.winfo_y()
+        if self._user_sized:
+            self.store.ui["width"] = self.root.winfo_width()
+            self.store.ui["height"] = self.root.winfo_height()
         self.store.save()
 
     def _popup_menu(self, event):
@@ -2923,6 +3023,28 @@ def run_check():
             if Store(path).state_of(
                     [i for i in Store(path).items if i["id"] == target["id"]][0]) != STATE_TODO:
                 problems.append("等待状态没有落盘")
+            # ---- 尺寸：默认排版不能变，拉大后要跟着重排 ----
+            default_w = _scaled(PANEL_W, widget.s)
+            default_h = _scaled(LIST_MAX_H, widget.s)
+            if widget.panel_w != default_w:
+                problems.append("默认面板宽度不对: %r（期望 %r）" % (widget.panel_w, default_w))
+            if widget.list_max_h != default_h:
+                problems.append("默认列表高度上限不对: %r（期望 %r）"
+                                % (widget.list_max_h, default_h))
+            narrow_wrap = widget.row_wrap
+            widget._apply_metrics(default_w + 200)
+            if widget.panel_w != default_w + 200:
+                problems.append("拉宽后没有按新宽度重算: %r" % (widget.panel_w,))
+            if widget.row_wrap <= narrow_wrap:
+                problems.append("拉宽后换行宽度没有跟着变大: %r → %r"
+                                % (narrow_wrap, widget.row_wrap))
+            widget._apply_metrics()
+            if widget.panel_w != default_w or widget.row_wrap != narrow_wrap:
+                problems.append("还原默认尺寸失败: %r / %r"
+                                % (widget.panel_w, widget.row_wrap))
+            if widget._list_space(default_h * 3) <= default_h:
+                problems.append("窗口拉高后没有把多出来的高度给列表")
+
             # ---- 默认排序：未完成 → 等待中 → 已完成 ----
             for entry in list(broken.items):          # 先把状态归一，免得受前面用例影响
                 if broken.state_of(entry) == STATE_WAITING:
