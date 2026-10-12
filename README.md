@@ -10,8 +10,11 @@
 > **默认不置顶**：它就是普通窗口，别的窗口盖上来就把它盖住，不会一直挡在前面。
 > **它也不在任务栏 / dock 里显示图标**；Windows 上会在右下托盘挂一个图标，
 > **左键唤回窗口、右键弹出菜单**（Linux 侧见「平台差异」）。
-> 也可以**再运行一次同样的命令**把它叫到最前面——不会开出第二个窗口。
+> 也可以**再运行一次同样的命令**把它叫到最前面——不会开出第二个窗口；
+> Linux 上还能按全局快捷键 **`Super+T`** 一键唤回。
 > 确实想让它一直浮在最上面时，在右键菜单里勾「始终置顶」（勾选状态会记住）。
+>
+> 每件事有**三种状态**：未完成 / **等待中**（已着手，但在等别人反馈）/ 已完成。
 
 ![预览](preview.png)
 
@@ -48,6 +51,14 @@ python desktop_todo.py
 - **再运行一次同样的命令 = 把已经在跑的窗口叫到最前面**（不会开出第二个窗口）。
   它不在任务栏里，所以这也是最顺手的唤回方式；`Alt+Tab` 里能不能找到它取决于平台
   （Windows 上 `WS_EX_TOOLWINDOW` 会把它从 `Alt+Tab` 里也拿掉，见「平台差异」）。
+- **Linux 上还可以按全局快捷键唤回：默认 `Super+T`**（不占任务栏、又没有托盘图标时，
+  这是最可靠的入口：焦点在哪个程序上都能把挂件提到最前）。换一个键：
+
+  ```bash
+  python3 desktop_todo.py --hotkey "Ctrl+Alt+K"   # 写进数据文件，下次启动生效
+  ```
+  键被别的程序占了会**注册不上**（`--doctor` 里会明确写出来，并建议换一个）；
+  程序退出时会把这个键解掉。
 - 关掉它：点右上角 `×`；Linux 上也可以 `pkill -f desktop_todo.py`。
 
 开机自启（Linux 写 `~/.config/autostart/desktop-todo.desktop`；Windows 写
@@ -88,6 +99,7 @@ python3 desktop_todo.py --doctor
 | 输入框回车 / 点 `+` | 添加一条待办（新条目排在最前） |
 | **按住条目上下拖动** | **调整顺序**（拖过谁就跟谁换位，松手即保存） |
 | 点条目文字或左边方框 | 标记完成 / 取消完成（完成后文字加删除线） |
+| **点条目右侧的小钟** | **标记 / 取消「等待中」**（已着手，但在等别人反馈，见下） |
 | **双击条目** | **改文字**（回车保存、`Esc` 取消、点到别处也算保存；空文字不生效） |
 | 点条目右侧 `×` | 删除该条；底部同时出现「撤销」，8 秒内点它可按原位置放回 |
 | 点底部「清除已完成」 | 删除所有已完成条目 |
@@ -96,33 +108,53 @@ python3 desktop_todo.py --doctor
 | 右键标题栏 | 折叠、**始终置顶开关（默认关闭）**、窗口透明度、退出 |
 | `Esc` | 清空输入框 |
 
-标题栏右侧会实时显示「*N* 项未完成」，全部完成时显示「全部完成」。
+标题栏右侧会实时显示进度：有等待中的条目时是「*N* 项未完成 · *M* 等待」，
+全部完成时显示「全部完成」。
 条目多的时候列表区最高 268px，超出可用滚轮滚动；拖动时拖到列表上下边缘会自动滚动。
 
-被别的窗口挡住时：**再运行一次 `python3 desktop_todo.py`**（已开的那个窗口会浮到最前面，
-不会有第二个实例）；或者用 `Alt+Tab` / 点它露出来的部分。
+**三种状态**（一件事不一定只有「没做」和「做完」两种）：
+
+| 状态 | 长什么样 | 什么时候用 |
+| --- | --- | --- |
+| 未完成 | 白字 + 空方框 | 还没开始，或者正在自己手上做 |
+| **等待中** | 琥珀色文字 + 琥珀小钟 | **已经着手了，但卡在别人那儿**：等同事回字段、等财务打款、等对方反馈 —— 自己现在什么也做不了，可它又确实没完成 |
+| 已完成 | 灰字 + 删除线 + 蓝勾 | 真的做完了 |
+
+「等待中」不是「完成」的另一种说法，所以：
+
+- 它仍算在「未完成」里（`remaining` 不含已完成），但计数单列出来，免得天天看着它以为自己拖着；
+- 点方框仍然可以把它直接勾成已完成（等到了，就收工）；再点一次小钟就回到未完成；
+- 「清除已完成」只清已完成，不会把等待中的条目一起清掉；
+- 老数据文件（只有 `done` 字段、没有 `state`）会自动按 `done` 推断成「已完成 / 未完成」，
+  读进来照常用；写回去时两个字段都写，所以旧版本程序（含 Windows 版）读同一份数据也不会看错。
+
+被别的窗口挡住时：**按全局快捷键 `Super+T`**（Linux，可用 `--hotkey` 改）、
+**再运行一次 `python3 desktop_todo.py`**（已开的那个窗口会浮到最前面，不会有第二个实例），
+或者用 `Alt+Tab` / 点它露出来的部分。
 
 ## 数据
 
 - 待办与窗口状态：Linux 是 `~/.local/share/desktop-todo/todos.json`，Windows 是
   `%APPDATA%\desktop-todo\todos.json`（用 `python3 desktop_todo.py --data-file`
   打印当前平台的实际路径）
-- 结构：`items[]` 保存条目（`id / text / done / created`），`ui` 保存窗口
-  `x / y / collapsed / alpha / topmost`。
+- 结构：`items[]` 保存条目（`id / text / done / state / created`；`state` 是
+  `todo` / `waiting` / `done`，`done` 与它保持一致以免旧版本看错），`ui` 保存窗口
+  `x / y / collapsed / alpha / topmost / hotkey`。
 - 写入是「临时文件 + 原子替换」，不会写坏；数据文件损坏时自动备份为
   `todos.json.broken` 并以空清单启动。
 
 ## 平台差异
 
-平台相关的东西只有四处（窗口外观、数据与自启路径、单实例唤回、托盘图标），都收在
-`PlatformBackend` / `X11Backend` / `WindowsBackend` 里，业务代码只认接口（`get_backend()`）：
+平台相关的东西只有五处（窗口外观、数据与自启路径、单实例唤回、托盘图标、全局快捷键），
+都收在 `PlatformBackend` / `X11Backend` / `WindowsBackend` 里，业务代码只认接口（`get_backend()`）：
 
 | | 统信 UOS / Deepin（X11） | Windows 11 |
 | --- | --- | --- |
 | 去标题栏 | `_MOTIF_WM_HINTS` 的 `decorations=0`（窗口仍由 WM 托管，输入框能拿焦点） | 清掉 `WS_CAPTION` + `WS_THICKFRAME`（同样保留系统托管） |
 | 不进任务栏 | EWMH 的 `_NET_WM_STATE_SKIP_TASKBAR` + `SKIP_PAGER` | `WS_EX_TOOLWINDOW` |
 | 唤回（再运行一次） | unix 套接字发 `raise`，窗口 `lift()` + 短暂置顶 + `focus_force()` | 以「窗口还在不在」为准，直接 `FindWindowW` + `SetForegroundWindow` |
-| 托盘图标 | 未实现（仍靠再运行一次唤回） | `Shell_NotifyIcon`：左键唤回 / 右键菜单 |
+| 托盘图标 | 未实现（Deepin 23 的 dde-dock 只画它自己「持有列表」里的托盘项，第三方注册得再规范也不显示；见「实现说明」） | `Shell_NotifyIcon`：左键唤回 / 右键菜单 |
+| 全局快捷键 | `XGrabKey` 抓根窗口，默认 `Super+T`（`--hotkey` 可改） | 未实现（有托盘可用，没必要再抢一个全局键） |
 | 数据目录 | `$XDG_DATA_HOME` 或 `~/.local/share/desktop-todo` | `%APPDATA%\desktop-todo` |
 | 开机自启 | `~/.config/autostart/desktop-todo.desktop`，**外加** `~/.local/share/applications/desktop-todo.desktop`（Deepin/UOS 的 startdde 要能解析出应用 id，否则会删掉自启项） | `HKCU\...\Run`，用 `pythonw.exe` 启动 |
 | 中文字体 | Noto Sans CJK SC / 思源黑体 / 文泉驿微米黑 | Microsoft YaHei UI |
@@ -152,6 +184,31 @@ python3 desktop_todo.py --doctor
   没有 `AF_UNIX`、Tk 也没有 `createfilehandler`，所以改用「按标题找窗口」判重：
   窗口还在就唤回它、自己退出（命名互斥体只当旁证）。任务栏里没有入口的情况下，
   这就是最可靠的找回方式。
+- **全局快捷键（Linux）**：`XGrabKey` 把键抓在**根窗口**上（`owner_events=False`），
+  按键事件就进程序自己的 X 连接队列，所以只要一个 120ms 的 Tk 定时器轮询
+  `XPending`，不需要线程、也不用碰 Tk 的事件循环。细节都来自实测：
+  ① 大小写锁 / 数字锁会让「同一个键」变成不同的修饰组合，所以 `0 / Lock / Mod2 /
+  两者` 四种掩码都要抓，否则开着大写锁快捷键就失效；② 键被别的程序占住时 X 会报
+  `BadAccess`，而**默认错误处理器会直接把进程打掉**，所以抓之前先换上自己的处理器、
+  抓完立刻换回来，被占用就如实报「注册不上」（`--doctor` 里能看到）并建议换一个；
+  ③ 退出（含点 `×`）时要 `XUngrabKey` + 关连接，否则那个键会一直被空占着。
+- **等待中（三态）**：数据里是 `state: todo / waiting / done`，同时把 `done` 一起写，
+  让旧版本（含 Windows 版）读同一份文件不会看错；读老文件时缺 `state` 就按 `done`
+  推断。界面上「等待」是一个**独立的小钟按钮**（Canvas 画的圆环 + 两根指针，不用
+  `⏳` 这种字符——符号在不同字体下宽度和字形不可控），点它只改这一行、原地重画，
+  和勾选走同一条 `_redraw_row` 路径，所以双击改名不会被它带坏；小钟在「钟上按下、
+  移出去再松手」时不算数，和 `×` 的判定一致。
+- **为什么 Linux 没有托盘图标**：2026-10-12 在 Deepin 23（dde-dock 5.10.16）上把
+  三条路都试到底了：① 自己实现 SNI（`StatusNotifierItem`）——托盘管理器会把属性
+  逐个读走（13 次 `Get`），但 dock 不画；② 用 GTK 的 `GtkStatusIcon`（和能显示的
+  `xfce4-notes` 同一个 API）——图标窗口能进 `com.deepin.dde.TrayManager` 的
+  `TrayIcons`、X 属性与 `xfce4-notes` 逐字段一致（`_XEMBED_INFO=0x1,0x1`、
+  16×16、`IsViewable`），但 dock 依然不画，日志里也从没为它建过 `XEmbedTrayWidget`；
+  ③ 摸到 dock 的托盘插件把「持有列表」存在 dconf
+  （`[dde/dock] plugin-settings` → `tray.holded_window:xfce4-notes=true`，
+  微信那条是 `false` 所以不显示），往里写 `desktop-todo` + 调 `ReloadPlugins()`
+  + 重启整个 dock，仍然不画。结论：这一版 dock 只画它自己认可的托盘项，第三方注册
+  得再规范也没用，于是改用**全局快捷键**来做「唤回」这个真正需要的功能。
 - **托盘图标（Windows）**：用 `Shell_NotifyIcon` 挂图标，但**不用它的回调消息**——
   那需要把 Tk 顶层窗口的 `WndProc` 子类化、再从 C 回调里回到 Python；2026-10-11 实测
   会在 Tk 的 `update()` 内部触发

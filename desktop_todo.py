@@ -2,20 +2,24 @@
 # -*- coding: utf-8 -*-
 """桌面待办清单挂件（Deepin / X11 + tkinter）。
 
-一个常驻桌面、无边框的小窗口：回车添加、点勾选完成、点 × 删除，
-所有改动立即写入 JSON，重开自动恢复待办与窗口位置。
+一个常驻桌面、无边框的小窗口：回车添加、点勾选完成、点右侧小钟标记「等待中」，
+点 × 删除，所有改动立即写入 JSON，重开自动恢复待办与窗口位置。
+
+每件事有三种状态：未完成 / 等待中（已着手，但在等别人反馈，自己现在动不了）/ 已完成。
 
 默认**不置顶**：它就是普通窗口，会被别的窗口盖住，不会一直挡在前面；
 需要时在右键菜单里勾「始终置顶」（勾选状态会记住）。
 
 它也**不在任务栏 / dock 里显示图标**（EWMH 的 `SKIP_TASKBAR`/`SKIP_PAGER`）。
-被别的窗口盖住后，用 `Alt+Tab`，或者**再运行一次本程序**，就能把它叫到最前面。
+被别的窗口盖住后，按全局快捷键（Linux，默认 `Super+T`）、用 `Alt+Tab`，
+或者**再运行一次本程序**，都能把它叫到最前面。
 
 用法::
 
     python3 desktop_todo.py                    # 启动挂件；已在运行则把窗口叫到前面
     python3 desktop_todo.py --check            # 自检（数据读写 + 界面构造）后退出
     python3 desktop_todo.py --doctor           # 打印环境/窗口能力诊断报告后退出
+    python3 desktop_todo.py --hotkey "Ctrl+Alt+K"    # 改全局唤回快捷键
     python3 desktop_todo.py --install-autostart     # 开机自启
     python3 desktop_todo.py --uninstall-autostart   # 取消开机自启
 
@@ -23,7 +27,9 @@
 
     回车 / 「+」      添加待办
     点文字或方框      标记完成 / 取消完成
+    点右侧小钟        标记 / 取消「等待中」
     按住条目上下拖     调整顺序（松手即保存）
+    双击条目          改文字
     点 ×             删除该条
     拖标题栏          移动窗口
     双击标题栏        折叠 / 展开（右键标题栏还有菜单）
@@ -79,6 +85,13 @@ ROW_WRAP = LIST_W - TEXT_X - DEL_W - 4  # 条目文字换行宽度
 UNDO_SECONDS = 8       # 删除后「撤销」保留的秒数
 DOUBLE_CLICK_REVERT_S = 0.8   # 双击进入编辑时，把第一次单击的勾选撤回的时间窗
 
+# 条目状态：未完成 / 等待中 / 已完成
+# 「等待中」= 已经着手了，但在等别人反馈（现在自己动不了），所以既不算完成、也不该被当成待办催自己。
+STATE_TODO = "todo"
+STATE_WAITING = "waiting"
+STATE_DONE = "done"
+WAIT_W = 30             # 条目右侧「等待」按钮的点击区宽度（在删除区左边）
+
 C_CARD = "#24272c"     # 卡片底色
 C_LIST = "#1d2024"     # 输入框 / 列表底色
 C_BORDER = "#3a3f47"   # 边框
@@ -89,6 +102,7 @@ C_ACCENT = "#4c9aff"   # 强调色
 C_DANGER = "#e5695f"   # 删除悬停
 C_HOVER = "#2e333a"    # 拖动中的条目底色
 C_DONE = "#7b828c"     # 已完成文字
+C_WAIT = "#e0a33e"     # 等待中文字 / 图标
 
 PLACEHOLDER = "添加一条待办，回车确认"
 FONT_STACK = (
@@ -261,6 +275,253 @@ def set_skip_taskbar(root):
                        ctypes.byref(event))
 
     return _on_wm_window(root, apply)
+
+
+# --------------------------------------------------------------------------- #
+# 全局快捷键（X11：把键抓在根窗口上，不需要 WM 配合）
+#
+# 为什么需要它：这个窗口刻意不进任务栏、也没有托盘图标（Deepin 23 的 dde-dock
+# 只画它自己「持有列表」里的托盘项，第三方注册得再规范也不显示），
+# 于是「把窗口叫回来」就只剩「再运行一次本程序」。全局快捷键把这个入口补上：
+# 无论当前焦点在哪个窗口，按一下就能把它提到最前。
+#
+# XGrabKey 抓在根窗口上、owner_events=False：按键事件直接进我们这个 X 连接的队列，
+# 所以用一个 Tk 定时器轮询就够了，不需要线程，也不需要动 Tk 自己的事件循环。
+# --------------------------------------------------------------------------- #
+HOTKEY_DEFAULT = "Super+T"
+
+_HOTKEY_MODS = {
+    "shift": 0x0001, "lock": 0x0002, "ctrl": 0x0004, "control": 0x0004,
+    "mod1": 0x0008, "alt": 0x0008, "meta": 0x0008, "mod2": 0x0010,
+    "mod3": 0x0020, "mod4": 0x0040, "super": 0x0040, "win": 0x0040,
+    "cmd": 0x0040, "mod5": 0x0080,
+}
+_HOTKEY_KEYS = {
+    "space": "space", "esc": "Escape", "escape": "Escape", "enter": "Return",
+    "return": "Return", "tab": "Tab", "backspace": "BackSpace", "insert": "Insert",
+    "delete": "Delete", "home": "Home", "end": "End", "up": "Up", "down": "Down",
+    "left": "Left", "right": "Right", "pageup": "Prior", "pagedown": "Next",
+    "comma": "comma", "period": "period", "slash": "slash", "semicolon": "semicolon",
+    "quote": "apostrophe", "backslash": "backslash", "minus": "minus", "equal": "equal",
+    "grave": "grave", "bracketleft": "bracketleft", "bracketright": "bracketright",
+}
+_HOTKEY_LOCK_MASKS = (0x0000, 0x0002, 0x0010, 0x0002 | 0x0010)   # 无 / 大小写锁 / 数字锁 / 两者
+
+
+def parse_hotkey(spec):
+    """把 ``"Super+T"`` / ``"Ctrl+Alt+K"`` / ``"F5"`` 解析成 (修饰位掩码, keysym 名)。
+
+    认不出来就返回 None（调用方据此退回默认值），不抛异常。
+    """
+    text = str(spec or "").replace(" ", "")
+    if not text:
+        return None
+    mods, key = 0, None
+    for piece in text.replace("-", "+").split("+"):
+        piece = piece.strip().lower()
+        if not piece:
+            continue
+        if piece in _HOTKEY_MODS:
+            mods |= _HOTKEY_MODS[piece]
+            continue
+        if key is not None:
+            return None                       # 出现了第二个主键，认不出来
+        if piece in _HOTKEY_KEYS:
+            key = _HOTKEY_KEYS[piece]
+        elif len(piece) == 1 and ord(piece) < 128:
+            key = piece
+        elif len(piece) <= 3 and piece[0] == "f" and piece[1:].isdigit() \
+                and 1 <= int(piece[1:]) <= 24:
+            key = piece.upper()
+        else:
+            return None
+    if key is None:
+        return None
+    return mods, key
+
+
+def format_hotkey(spec):
+    """把快捷键写成统一好看的样子（认不出来就原样返回）。"""
+    parsed = parse_hotkey(spec)
+    if parsed is None:
+        return str(spec or "")
+    mods, key = parsed
+    names = []
+    for name, mask in (("Ctrl", 0x0004), ("Alt", 0x0008), ("Shift", 0x0001),
+                       ("Super", 0x0040)):
+        if mods & mask:
+            names.append(name)
+    if key.startswith("F") and key[1:].isdigit():
+        shown = key
+    elif len(key) == 1:
+        shown = key.upper()
+    else:
+        shown = {"space": "Space", "Return": "Enter", "Escape": "Esc", "Prior": "PageUp",
+                 "Next": "PageDown", "BackSpace": "Backspace"}.get(key, key)
+    return "+".join(names + [shown])
+
+
+class _XKeyEvent(ctypes.Structure):
+    """XKeyEvent 的前半段（XEvent 是联合体，这里只按 KeyPress 解释）。"""
+
+    _fields_ = [
+        ("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int), ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong), ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong), ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int), ("y", ctypes.c_int),
+        ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint), ("keycode", ctypes.c_uint),
+        ("same_screen", ctypes.c_int),
+    ]
+
+
+class X11Hotkey(object):
+    """X11 全局快捷键：抓根窗口 + Tk 定时器轮询。"""
+
+    POLL_MS = 120
+    KEY_PRESS = 2
+    GRAB_MODE_ASYNC = 1
+
+    def __init__(self):
+        self.display = None
+        self.root_window = 0
+        self.keycode = 0
+        self.masks = []
+        self.callback = None
+        self.job = None
+        self.spec = None
+
+    # ---- 注册 / 注销 ----
+    def install(self, root, spec, callback):
+        parsed = parse_hotkey(spec)
+        if parsed is None:
+            return False
+        mods, key = parsed
+        x11 = self._open()
+        if x11 is None:
+            return False
+        keysym = x11.XStringToKeysym(key.encode("ascii"))
+        if not keysym:
+            self._close(x11)
+            return False
+        keycode = x11.XKeysymToKeycode(ctypes.c_void_p(self.display), ctypes.c_ulong(keysym))
+        if not keycode:
+            self._close(x11)
+            return False
+
+        self.root_window = x11.XDefaultRootWindow(ctypes.c_void_p(self.display))
+        self.keycode = int(keycode)
+        self.masks = [mods | extra for extra in _HOTKEY_LOCK_MASKS]
+        # 抓的时候把 X 的默认错误处理器换掉：键被别的程序占了是 BadAccess，
+        # 默认处理器会直接把进程打掉，必须自己收下这次错误。
+        failed = []
+        handler = self._handler_type(lambda display, event: failed.append(True) or 0)
+        self._handler = handler                    # 别让回调被回收
+        previous = x11.XSetErrorHandler(ctypes.cast(handler, ctypes.c_void_p))
+        try:
+            for mask in self.masks:
+                x11.XGrabKey(ctypes.c_void_p(self.display), ctypes.c_int(self.keycode),
+                             ctypes.c_uint(mask), ctypes.c_ulong(self.root_window),
+                             ctypes.c_int(0), ctypes.c_int(self.GRAB_MODE_ASYNC),
+                             ctypes.c_int(self.GRAB_MODE_ASYNC))
+            x11.XSync(ctypes.c_void_p(self.display), ctypes.c_int(0))
+        finally:
+            x11.XSetErrorHandler(previous)
+        if failed:
+            self.remove()
+            self._close(x11)
+            return False
+        self.callback = callback
+        self.spec = spec
+        self.job = (root, root.after(self.POLL_MS, self._poll, root))
+        return True
+
+    def remove(self):
+        """注销（幂等）：先撤 after 任务，再解抓、关连接。"""
+        if self.job is not None:
+            root, job_id = self.job
+            self.job = None
+            try:
+                root.after_cancel(job_id)
+            except Exception:
+                pass
+        if self.display is None:
+            return
+        x11 = self._x11
+        if x11 is not None and self.keycode:
+            for mask in self.masks:
+                try:
+                    x11.XUngrabKey(ctypes.c_void_p(self.display), ctypes.c_int(self.keycode),
+                                   ctypes.c_uint(mask), ctypes.c_ulong(self.root_window))
+                except Exception:
+                    pass
+            try:
+                x11.XSync(ctypes.c_void_p(self.display), ctypes.c_int(0))
+            except Exception:
+                pass
+        self._close(x11)
+
+    # ---- 内部 ----
+    _x11 = None
+    _handler_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+    def _open(self):
+        """开一条自己的 X 连接（必须活着，抓的键才有效）。"""
+        try:
+            x11 = ctypes.CDLL("libX11.so.6")
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x11.XDefaultRootWindow.restype = ctypes.c_ulong
+            x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            x11.XStringToKeysym.restype = ctypes.c_ulong
+            x11.XStringToKeysym.argtypes = [ctypes.c_char_p]
+            x11.XKeysymToKeycode.restype = ctypes.c_ubyte
+            x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            x11.XSetErrorHandler.restype = ctypes.c_void_p
+            x11.XSetErrorHandler.argtypes = [ctypes.c_void_p]
+            x11.XPending.restype = ctypes.c_int
+            x11.XPending.argtypes = [ctypes.c_void_p]
+        except (OSError, AttributeError):
+            return None
+        display = x11.XOpenDisplay(None)
+        if not display:
+            return None
+        self.display = display
+        self._x11 = x11
+        return x11
+
+    def _close(self, x11):
+        if self.display is not None and x11 is not None:
+            try:
+                x11.XCloseDisplay(ctypes.c_void_p(self.display))
+            except Exception:
+                pass
+        self.display = None
+        self.keycode = 0
+        self.masks = []
+
+    def _poll(self, root):
+        """定时器回调：把队列里的事件读掉，命中快捷键就回调。"""
+        self.job = None
+        x11 = self._x11
+        if x11 is not None and self.display is not None:
+            try:
+                buffer = ctypes.create_string_buffer(192)
+                while x11.XPending(ctypes.c_void_p(self.display)):
+                    x11.XNextEvent(ctypes.c_void_p(self.display), buffer)
+                    event = ctypes.cast(buffer, ctypes.POINTER(_XKeyEvent)).contents
+                    if event.type == self.KEY_PRESS and self.callback is not None:
+                        try:
+                            self.callback()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        try:
+            self.job = (root, root.after(self.POLL_MS, self._poll, root))
+        except tk.TclError:
+            self.job = None
 
 
 # --------------------------------------------------------------------------- #
@@ -660,6 +921,13 @@ class PlatformBackend(object):
     def tray_remove(self, root):
         """摘掉托盘图标（窗口销毁前调用）。"""
 
+    def hotkey_install(self, root, spec, callback):
+        """注册全局快捷键（按下时调用 callback()）。返回是否成功。"""
+        return False
+
+    def hotkey_remove(self):
+        """注销全局快捷键（退出前调用）。"""
+
     def activate_window(self, root, topmost):
         """把窗口叫到最前面，且不改变用户设置的「始终置顶」状态。"""
         try:
@@ -713,6 +981,7 @@ class X11Backend(PlatformBackend):
 
     def __init__(self):
         self._server = None
+        self._hotkey = None
 
     def strip_decorations(self, root):
         return strip_window_decorations(root)
@@ -775,6 +1044,19 @@ class X11Backend(PlatformBackend):
 
     def raise_running_instance(self):
         return raise_running_instance()
+
+    # ---- 全局快捷键：XGrabKey 抓根窗口（不占任务栏、也没有托盘时的唤回入口）----
+    def hotkey_install(self, root, spec, callback):
+        self._hotkey = X11Hotkey()
+        if self._hotkey.install(root, spec, callback):
+            return True
+        self._hotkey = None
+        return False
+
+    def hotkey_remove(self):
+        if getattr(self, "_hotkey", None) is not None:
+            self._hotkey.remove()
+            self._hotkey = None
 
     # ---- 开机自启：~/.config/autostart/*.desktop ----
     #
@@ -1119,7 +1401,8 @@ class Store(object):
         self.items = []
         # topmost 默认关闭：不置顶，就不会一直挡在其他窗口前面。
         # 需要时在右键菜单里勾「始终置顶」，勾选状态会被记住。
-        self.ui = {"x": None, "y": None, "collapsed": False, "alpha": 0.94, "topmost": False}
+        self.ui = {"x": None, "y": None, "collapsed": False, "alpha": 0.94,
+                   "topmost": False, "hotkey": HOTKEY_DEFAULT}
         self._next_id = 1
         self.load()
 
@@ -1149,10 +1432,17 @@ class Store(object):
                     item_id = int(entry.get("id"))
                 except (TypeError, ValueError):
                     item_id = index + 1
+                # 新格式有 state（todo / waiting / done）；旧格式只有 done（bool）。
+                # 两者都留着并保持一致：老版本程序（含 Windows 版）读 done 也不会看错。
+                done = bool(entry.get("done"))
+                state = str(entry.get("state") or "")
+                if state not in (STATE_TODO, STATE_WAITING, STATE_DONE):
+                    state = STATE_DONE if done else STATE_TODO
                 self.items.append({
                     "id": item_id,
                     "text": text,
-                    "done": bool(entry.get("done")),
+                    "done": state == STATE_DONE,
+                    "state": state,
                     "created": float(entry.get("created") or time.time()),
                 })
         if self.items:
@@ -1168,6 +1458,9 @@ class Store(object):
                 self.ui["collapsed"] = ui["collapsed"]
             if isinstance(ui.get("topmost"), bool):
                 self.ui["topmost"] = ui["topmost"]
+            hotkey = ui.get("hotkey")
+            if isinstance(hotkey, str) and parse_hotkey(hotkey) is not None:
+                self.ui["hotkey"] = hotkey
             alpha = ui.get("alpha")
             if isinstance(alpha, (int, float)) and 0.3 <= float(alpha) <= 1.0:
                 self.ui["alpha"] = float(alpha)
@@ -1198,19 +1491,44 @@ class Store(object):
         text = " ".join(str(text).split())
         if not text:
             return None
-        item = {"id": self._next_id, "text": text, "done": False, "created": time.time()}
+        item = {"id": self._next_id, "text": text, "done": False,
+                "state": STATE_TODO, "created": time.time()}
         self._next_id += 1
         self.items.insert(0, item)
         self.save()
         return item
 
+    def _set_state(self, item, state):
+        """统一改状态：state 为准，done 跟着同步，然后落盘。"""
+        item["state"] = state
+        item["done"] = state == STATE_DONE
+        self.save()
+        return item
+
     def toggle(self, item_id):
+        """勾选 / 取消勾选：等待中或未完成 → 已完成；已完成 → 未完成。"""
         for item in self.items:
             if item["id"] == item_id:
-                item["done"] = not item["done"]
-                self.save()
-                return item
+                state = item.get("state", STATE_DONE if item["done"] else STATE_TODO)
+                return self._set_state(
+                    item, STATE_TODO if state == STATE_DONE else STATE_DONE)
         return None
+
+    def toggle_waiting(self, item_id):
+        """「等待中」开关：未完成/已完成 → 等待中，等待中 → 未完成。"""
+        for item in self.items:
+            if item["id"] == item_id:
+                state = item.get("state", STATE_DONE if item["done"] else STATE_TODO)
+                return self._set_state(
+                    item, STATE_TODO if state == STATE_WAITING else STATE_WAITING)
+        return None
+
+    def state_of(self, item):
+        """取条目状态（兼容老数据：只认 done 的条目）。"""
+        state = item.get("state")
+        if state in (STATE_TODO, STATE_WAITING, STATE_DONE):
+            return state
+        return STATE_DONE if item.get("done") else STATE_TODO
 
     def move(self, item_id, index, save=True):
         """把某条挪到列表的第 index 个位置（index 按移动前的列表计算）。
@@ -1287,7 +1605,11 @@ class Store(object):
         return 0
 
     def remaining(self):
-        return len([item for item in self.items if not item["done"]])
+        """还没完成的条数（等待中算没完成 —— 事情确实还没了）。"""
+        return len([item for item in self.items if self.state_of(item) != STATE_DONE])
+
+    def waiting_count(self):
+        return len([item for item in self.items if self.state_of(item) == STATE_WAITING])
 
     def has_done(self):
         return any(item["done"] for item in self.items)
@@ -1311,8 +1633,9 @@ class TodoWidget(object):
         self.list_max_h = _scaled(LIST_MAX_H, self.s)
         self.text_x = _scaled(TEXT_X, self.s)
         self.del_w = _scaled(DEL_W, self.s)
+        self.wait_w = _scaled(WAIT_W, self.s)
         self.row_pad_y = _scaled(ROW_PAD_Y, self.s)
-        self.row_wrap = self.list_w - self.text_x - self.del_w - _scaled(4, self.s)
+        self.row_wrap = self.list_w - self.text_x - self.del_w - self.wait_w - _scaled(4, self.s)
         self.header_h = _scaled(34, self.s)
         self.icon_box = _scaled(20, self.s)
         self.check_box = _scaled(16, self.s)
@@ -1344,6 +1667,10 @@ class TodoWidget(object):
             # 挂托盘图标：左键唤回、右键弹菜单（Windows 实现；其它平台是空操作）
             self._tray_on = self.backend.tray_install(
                 self.root, self.raise_window, self._popup_menu_at_cursor)
+            # 全局快捷键：不占任务栏、又没有托盘时，这是最可靠的唤回入口
+            self._hotkey_spec = self.store.ui.get("hotkey") or HOTKEY_DEFAULT
+            self._hotkey_on = self.backend.hotkey_install(
+                self.root, self._hotkey_spec, self.raise_window)
 
     # ---- 单实例 / 唤回 ----
     def raise_window(self):
@@ -1660,26 +1987,57 @@ class TodoWidget(object):
     def _draw_row(self, canvas, item):
         """把一条待办画进行画布（新建与原地重画共用）。
 
+        三种状态的视觉：
+          未完成 = 白字 + 空方框；
+          等待中 = 琥珀字 + 琥珀小钟（已经着手，但在等别人反馈，现在自己动不了）；
+          已完成 = 灰字加删除线 + 蓝勾。
+
         返回 (删除按钮的图元 id, 行高)；行高变化时会同步 canvas 的 height。
         """
         canvas.delete("all")
-        font = self.fonts["done"] if item["done"] else self.fonts["base"]
+        state = self.store.state_of(item)
+        done = state == STATE_DONE
+        waiting = state == STATE_WAITING
+        font = self.fonts["done"] if done else self.fonts["base"]
         line_h = font.metrics("linespace")
         lines = self._wrap_text(item["text"], font, self.row_wrap)
         row_h = line_h * len(lines) + 2 * self.row_pad_y
         if int(canvas.cget("height")) != row_h:
             canvas.configure(height=row_h)
 
-        self._draw_check(canvas, item["done"], top=(row_h - self.check_box) // 2)
+        self._draw_check(canvas, done, top=(row_h - self.check_box) // 2)
+        text_color = C_DONE if done else (C_WAIT if waiting else C_TEXT)
         for index, line in enumerate(lines):
             canvas.create_text(self.text_x, self.row_pad_y + index * line_h, text=line,
-                               anchor="nw",
-                               fill=C_DONE if item["done"] else C_TEXT, font=font)
+                               anchor="nw", fill=text_color, font=font)
+        self._draw_wait_icon(canvas, waiting, row_h)
         delete_id = canvas.create_text(self.list_w - self.px(12),
                                        row_h // 2 + self.px(1), text="×", anchor="e",
                                        fill=C_MUTED, font=self.fonts["bold"])
         canvas._delete_item = delete_id      # 悬停改色按它取，重画后自动是新 id
         return delete_id, row_h
+
+    def _draw_wait_icon(self, canvas, waiting, row_h):
+        """「等待中」按钮：画一个小钟（琥珀＝已标记等待，灰＝未标记）。
+
+        用 Canvas 图元画而不是 ⏳ 这类字符：符号在不同字体下的宽度/字形不可控，
+        而且这里要能单独改色做悬停反馈。三个图元都带 wait 标签，便于整体改色与自检。
+        """
+        size = float(self.px(12))
+        radius = size / 2.0
+        cx = self.list_w - self.del_w - self.wait_w / 2.0
+        cy = row_h // 2.0 + self.px(1)
+        color = C_WAIT if waiting else C_MUTED
+        width = max(1.0, self.s)
+        ring = canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
+                                  outline=color, width=width, tags="wait")
+        hand_h = canvas.create_line(cx, cy, cx, cy - radius * 0.55, fill=color,
+                                    width=width, capstyle="round", tags="wait")
+        hand_m = canvas.create_line(cx, cy, cx + radius * 0.5, cy + radius * 0.35,
+                                    fill=color, width=width, capstyle="round", tags="wait")
+        canvas._wait_items = (ring, hand_h, hand_m)
+        canvas._wait_base = color            # 未悬停时的底色，悬停反馈按它取
+        return ring
 
     def _redraw_row(self, item_id):
         """只重画这一行（原地更新），不重建控件。
@@ -1710,24 +2068,38 @@ class TodoWidget(object):
 
         item_id = item["id"]
 
+        def set_wait_color(color):
+            """改小钟颜色：圆环改 outline，指针改 fill。"""
+            for item_id in getattr(row, "_wait_items", ()) or ():
+                try:
+                    if row.type(item_id) == "oval":
+                        row.itemconfigure(item_id, outline=color)
+                    else:
+                        row.itemconfigure(item_id, fill=color)
+                except tk.TclError:
+                    return
+
         def on_motion(event):
             delete_id = getattr(row, "_delete_item", None)
-            if delete_id is None:
-                return
+            over_delete = event.x >= self.list_w - self.del_w
+            over_wait = (not over_delete) and event.x >= self.list_w - self.del_w - self.wait_w
             try:
-                row.itemconfigure(delete_id, fill=C_DANGER
-                                  if event.x >= self.list_w - self.del_w else C_MUTED)
+                if delete_id is not None:
+                    row.itemconfigure(delete_id, fill=C_DANGER if over_delete else C_MUTED)
             except tk.TclError:
                 pass
+            # 悬停时显示「点下去会变成什么」：未标记的亮成琥珀，已标记的暗下去
+            base = getattr(row, "_wait_base", C_MUTED)
+            set_wait_color((C_MUTED if base == C_WAIT else C_WAIT) if over_wait else base)
 
         def on_leave(event):
-            delete_id = getattr(row, "_delete_item", None)
-            if delete_id is None:
-                return
             try:
-                row.itemconfigure(delete_id, fill=C_MUTED)
+                delete_id = getattr(row, "_delete_item", None)
+                if delete_id is not None:
+                    row.itemconfigure(delete_id, fill=C_MUTED)
             except tk.TclError:
                 pass
+            set_wait_color(getattr(row, "_wait_base", C_MUTED))
 
         row.bind("<Button-1>", lambda event, i=item_id: self._row_press(event, i))
         row.bind("<B1-Motion>", self._row_motion)
@@ -1741,9 +2113,14 @@ class TodoWidget(object):
 
     # ---- 条目拖拽排序 ----
     def _row_press(self, event, item_id):
-        """记住按下的位置：按在右侧 × 上算删除，其余地方先当作可能的点击/拖拽。"""
-        self._press = {"id": item_id, "y": event.y_root,
-                       "zone": "delete" if event.x >= self.list_w - self.del_w else "body"}
+        """记住按下的位置：右侧 × 算删除，× 左边的时钟算「等待」，其余当可能的点击/拖拽。"""
+        if event.x >= self.list_w - self.del_w:
+            zone = "delete"
+        elif event.x >= self.list_w - self.del_w - self.wait_w:
+            zone = "wait"
+        else:
+            zone = "body"
+        self._press = {"id": item_id, "y": event.y_root, "zone": zone}
 
     def _row_motion(self, event):
         if self._press is None:
@@ -1767,6 +2144,9 @@ class TodoWidget(object):
         if press["zone"] == "delete":
             if event.x >= self.list_w - self.del_w:    # 松手时指针仍在 × 上才算删除
                 self.remove_item(press["id"])
+        elif press["zone"] == "wait":
+            if event.x >= self.list_w - self.del_w - self.wait_w:   # 松手时仍落在时钟上
+                self.toggle_waiting_item(press["id"])
         else:
             self.toggle_item(press["id"])
 
@@ -1868,8 +2248,11 @@ class TodoWidget(object):
 
     def _update_counts(self):
         remaining = self.store.remaining()
+        waiting = self.store.waiting_count()
         if self.store.items and remaining == 0:
             text = "全部完成"
+        elif waiting:
+            text = "%d 项未完成 · %d 等待" % (remaining, waiting)
         else:
             text = "%d 项未完成" % remaining
         self.count.configure(text=text)
@@ -2007,6 +2390,21 @@ class TodoWidget(object):
         self._update_footer()
         return item
 
+    def toggle_waiting_item(self, item_id):
+        """标记 / 取消「等待中」：同样只重画那一行。
+
+        等待中不是完成：事情已经着手，但在等别人反馈，所以从「未完成」里分出来单列，
+        计数里也单独显示，免得天天看到它以为自己在拖。
+        """
+        item = self.store.toggle_waiting(item_id)
+        if item is None:
+            return None
+        if not self._redraw_row(item_id):
+            self._refresh()
+        self._update_counts()
+        self._update_footer()
+        return item
+
     def remove_item(self, item_id):
         """删除一条：先记下它和原位置，底部留 8 秒撤销窗口。"""
         if self._edit_entry is not None:
@@ -2043,8 +2441,8 @@ class TodoWidget(object):
 
     def _begin_edit(self, item_id, event=None):
         """双击条目：在那一行上盖一个输入框；回车保存、Esc 取消、点到别处也算保存。"""
-        if event is not None and event.x >= self.list_w - self.del_w:
-            return                         # 双击落在删除区上，不当编辑
+        if event is not None and event.x >= self.list_w - self.del_w - self.wait_w:
+            return                         # 双击落在删除区/「等待」按钮上，不当编辑
         if self._edit_entry is not None:
             self._end_edit(save=True)      # 先收掉上一个
         # 双击的第一下已经按「单击 = 勾选」处理过了；双击的语义是改文字，
@@ -2128,6 +2526,7 @@ class TodoWidget(object):
         except tk.TclError:
             pass
         self._stop_autoscroll()
+        self.backend.hotkey_remove()              # 解掉全局快捷键（不然退出后那个键还空占着）
         self.backend.tray_remove(self.root)       # 先摘托盘图标并还原窗口过程
         self.backend.single_instance_stop(self.root)
         self.store.save()
@@ -2170,6 +2569,53 @@ def run_check():
             problems.append("切换完成状态失败")
         if Store(path).remaining() != 1:
             problems.append("完成状态未落盘")
+
+        # ---- 三态：未完成 / 等待中 / 已完成 ----
+        # 「等待中」= 已经着手，但在等别人反馈，自己现在动不了：既不算完成，也不该混在待办里催自己。
+        tri = Store(path)
+        tri.clear_done()
+        todo_item = tri.add("还没开始的一条")
+        wait_item = tri.add("等同事回字段的一条")
+        tri.toggle_waiting(wait_item["id"])
+        if tri.state_of(wait_item) != STATE_WAITING:
+            problems.append("toggle_waiting 没有把状态改成等待中")
+        if wait_item["done"]:
+            problems.append("等待中不该被算成已完成")
+        if tri.waiting_count() != 1:
+            problems.append("waiting_count 计数不对")
+        if tri.remaining() != len(tri.items):
+            problems.append("等待中的条目仍应算作「未完成」")
+        again = Store(path)
+        reading = [item for item in again.items if item["id"] == wait_item["id"]]
+        if not reading or reading[0].get("state") != STATE_WAITING or reading[0]["done"]:
+            problems.append("等待中状态没有落盘或被读错")
+        for item in again.items:            # done 与 state 必须始终一致（老版本只读 done）
+            if bool(item["done"]) != (again.state_of(item) == STATE_DONE):
+                problems.append("done 与 state 不同步: %r" % (item,))
+        again.toggle_waiting(wait_item["id"])          # 再点一次 → 回到未完成
+        if again.state_of([i for i in again.items if i["id"] == wait_item["id"]][0]) \
+                != STATE_TODO:
+            problems.append("取消「等待中」失败")
+        again.toggle_waiting(wait_item["id"])          # 等待中 → 勾选应为已完成
+        again.toggle(wait_item["id"])
+        if again.state_of([i for i in again.items if i["id"] == wait_item["id"]][0]) \
+                != STATE_DONE:
+            problems.append("等待中的条目勾选后应为已完成")
+        again.toggle_waiting(wait_item["id"])          # 回到未完成
+        again.toggle_waiting(wait_item["id"])          # 再标记等待中
+        again.toggle(todo_item["id"])                  # 另一条标记完成
+        if again.clear_done() != 1 or not any(i["id"] == wait_item["id"] for i in again.items):
+            problems.append("清除已完成时把「等待中」的条目也删了")
+
+        # 旧数据（只有 done、没有 state）要能读：缺 state 时按 done 推断
+        legacy_path = os.path.join(temp_dir, "legacy.json")
+        with open(legacy_path, "w", encoding="utf-8") as handle:
+            json.dump({"items": [{"id": 1, "text": "老格式已完成", "done": True},
+                                 {"id": 2, "text": "老格式未完成", "done": False}]}, handle)
+        legacy = Store(legacy_path)
+        legacy_states = [legacy.state_of(item) for item in legacy.items]
+        if legacy_states != [STATE_DONE, STATE_TODO]:
+            problems.append("旧格式数据没有正确推断状态: %r" % (legacy_states,))
 
         reloaded.ui.update({"x": 123, "y": 45, "collapsed": True, "alpha": 0.82})
         reloaded.save()
@@ -2305,6 +2751,32 @@ def run_check():
             if [item["text"] for item in broken.items] != order_before:
                 problems.append("撤销删除后内容或顺序不一致")
             widget._refresh()
+            # 「等待」按钮：点它只改这一行，并且必须原地重画成琥珀色
+            wait_x = widget.list_w - widget.del_w - widget.wait_w // 2
+            row_wait = widget._row_widget(target["id"])
+            widget._row_press(_StubEvent(x=wait_x), target["id"])
+            widget._row_release(_StubEvent(x=wait_x))
+            if widget.store.state_of(target) != STATE_WAITING:
+                problems.append("点「等待」按钮没有切到等待中")
+            if widget._row_widget(target["id"]) is not row_wait:
+                problems.append("标记等待中时行控件被重建了（双击会因此失效）")
+            if target["done"]:
+                problems.append("等待中不该同时是已完成")
+            ring = (getattr(row_wait, "_wait_items", None) or (None,))[0]
+            if ring is None or str(row_wait.itemcget(ring, "outline")) != C_WAIT:
+                problems.append("等待中的那一行小钟没有变成琥珀色（说明没重画）")
+            # 在钟上按下、移出去再松手 → 不该改状态
+            widget._row_press(_StubEvent(x=wait_x), target["id"])
+            widget._row_release(_StubEvent(x=widget.text_x))
+            if widget.store.state_of(target) != STATE_WAITING:
+                problems.append("在钟上按下但移出后松手，不该改状态")
+            widget._row_press(_StubEvent(x=wait_x), target["id"])   # 再点一次 → 未完成
+            widget._row_release(_StubEvent(x=wait_x))
+            if widget.store.state_of(target) != STATE_TODO:
+                problems.append("再点一次「等待」按钮没有回到未完成")
+            if Store(path).state_of(
+                    [i for i in Store(path).items if i["id"] == target["id"]][0]) != STATE_TODO:
+                problems.append("等待状态没有落盘")
             root.update()
             root.withdraw()
             root.update()
@@ -2500,7 +2972,7 @@ def run_doctor():
     row("env", "os / sys.platform", "%s / %s" % (os.name, sys.platform))
     row("env", "窗口后端", get_backend().name)
     row("env", "托盘图标", "Shell_NotifyIcon 可用（左键唤回 / 右键菜单）"
-        if win32_has_tray_api() else "当前平台未实现（仍靠再运行一次唤回）")
+        if win32_has_tray_api() else "当前平台未实现（Linux 用全局快捷键 / 再运行一次唤回）")
     row("env", "python", sys.version.split()[0])
     row("env", "脚本路径", os.path.abspath(__file__))
     row("env", "tk", "Tk %s" % tk.TkVersion if tk else "缺失（统信 UOS: apt install python3-tk）")
@@ -2526,8 +2998,17 @@ def run_doctor():
             with open(path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             items = payload.get("items") or []
-            done = len([item for item in items if item.get("done")])
-            row("data", "条目", "%d 条（已完成 %d）" % (len(items), done))
+
+            def _state_of(entry):
+                value = str(entry.get("state") or "")
+                if value in (STATE_TODO, STATE_WAITING, STATE_DONE):
+                    return value
+                return STATE_DONE if entry.get("done") else STATE_TODO
+
+            done = len([item for item in items if _state_of(item) == STATE_DONE])
+            waiting = len([item for item in items if _state_of(item) == STATE_WAITING])
+            row("data", "条目", "%d 条（未完成 %d / 等待中 %d / 已完成 %d）"
+                % (len(items), len(items) - done - waiting, waiting, done))
             caps.append(("数据文件可读", "OK", "%d 条" % len(items)))
         except Exception as error:
             row("data", "读取", "失败：%r" % (error,))
@@ -2600,6 +3081,34 @@ def run_doctor():
                 _doctor_x11(root, rows, caps)
         except Exception as error:
             row("probe", "窗口能力探测", "异常：%r" % (error,))
+        # ---- 全局快捷键：真去抓一次，再解开（抓不上通常是键被别的程序/已有实例占了）----
+        hotkey_spec = HOTKEY_DEFAULT
+        try:
+            hotkey_spec = Store(data_file()).ui.get("hotkey") or HOTKEY_DEFAULT
+        except Exception:
+            pass
+        backend = get_backend()
+        installed = False
+        try:
+            installed = backend.hotkey_install(root, hotkey_spec, lambda: None)
+        except Exception as error:
+            row("hotkey", "注册", "异常：%r" % (error,))
+        finally:
+            try:
+                backend.hotkey_remove()
+            except Exception:
+                pass
+        if os.name == "nt":
+            row("hotkey", "全局快捷键", "%s（Windows 后端未实现，靠托盘唤回）"
+                % format_hotkey(hotkey_spec))
+            caps.append(("全局快捷键", "N/A", "Windows 走托盘"))
+        else:
+            row("hotkey", "全局快捷键", "%s（%s）" % (
+                format_hotkey(hotkey_spec),
+                "注册成功" if installed else "没注册上：可能被别的程序占了，可换一个 "
+                "(--hotkey Ctrl+Alt+K)"))
+            caps.append(("全局快捷键", "OK" if installed else "WARN",
+                         format_hotkey(hotkey_spec)))
         try:
             families = set(tkfont.families())
             chosen = None
@@ -2657,6 +3166,7 @@ def main(argv=None):
     parser.add_argument("--install-autostart", action="store_true", help="写入 ~/.config/autostart 开机自启")
     parser.add_argument("--uninstall-autostart", action="store_true", help="移除开机自启")
     parser.add_argument("--data-file", action="store_true", help="打印数据文件路径后退出")
+    parser.add_argument("--hotkey", metavar="键位", help="设置全局唤回快捷键后退出（如 Super+T、Ctrl+Alt+K）")
     args = parser.parse_args(argv)
 
     if args.check:
@@ -2669,6 +3179,16 @@ def main(argv=None):
         return uninstall_autostart()
     if args.data_file:
         print(data_file())
+        return 0
+    if args.hotkey:
+        if parse_hotkey(args.hotkey) is None:
+            sys.stderr.write("认不出这个快捷键: %s（写成 Super+T / Ctrl+Alt+K / F5 这样）\n"
+                             % args.hotkey)
+            return 2
+        store = Store(data_file())
+        store.ui["hotkey"] = args.hotkey
+        store.save()
+        print("全局唤回快捷键 = %s（下次启动生效；冲突了可以换一个）" % format_hotkey(args.hotkey))
         return 0
 
     if tk is None:
@@ -2686,10 +3206,13 @@ def main(argv=None):
     root = tk.Tk(className=APP_ID)
     widget = TodoWidget(root, Store(data_file()))
     if os.environ.get("DESKTOP_TODO_VERBOSE"):
-        # 默认不输出；排障时设 DESKTOP_TODO_VERBOSE=1 就能看到托盘有没有挂上
+        # 默认不输出；排障时设 DESKTOP_TODO_VERBOSE=1 就能看到托盘/快捷键挂上没有
         # （重定向到文件时 stdout 是块缓冲，所以每行都 flush）
         print("窗口后端 = %s" % get_backend().name, flush=True)
         print("托盘图标 = %s" % bool(getattr(widget, "_tray_on", False)), flush=True)
+        print("全局快捷键 = %s（%s）" % (
+            format_hotkey(getattr(widget, "_hotkey_spec", "")),
+            "已注册" if getattr(widget, "_hotkey_on", False) else "没注册上"), flush=True)
         print("数据文件 = %s" % data_file(), flush=True)
     root.mainloop()
     return 0
