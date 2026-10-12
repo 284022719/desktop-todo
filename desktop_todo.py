@@ -77,6 +77,7 @@ DEL_W = 30             # 条目右侧删除按钮的点击区宽度
 ROW_PAD_Y = 6          # 条目上下内边距
 ROW_WRAP = LIST_W - TEXT_X - DEL_W - 4  # 条目文字换行宽度
 UNDO_SECONDS = 8       # 删除后「撤销」保留的秒数
+DOUBLE_CLICK_REVERT_S = 0.8   # 双击进入编辑时，把第一次单击的勾选撤回的时间窗
 
 C_CARD = "#24272c"     # 卡片底色
 C_LIST = "#1d2024"     # 输入框 / 列表底色
@@ -1295,6 +1296,7 @@ class TodoWidget(object):
         self._undo_job = None             # 撤销时限的 after 句柄
         self._edit_id = None              # 正在编辑的条目 id
         self._edit_entry = None           # 正在编辑的输入框（盖在那一行上）
+        self._last_toggle = (None, 0.0)   # 最近一次勾选（条目 id, 时间），供双击回退
         self._build()
         self._restore_position()
         self._apply_collapsed()
@@ -1621,37 +1623,84 @@ class TodoWidget(object):
             lines.append(current.rstrip())
         return [line for line in lines if line] or [""]
 
-    def _make_row(self, item):
+    def _draw_row(self, canvas, item):
+        """把一条待办画进行画布（新建与原地重画共用）。
+
+        返回 (删除按钮的图元 id, 行高)；行高变化时会同步 canvas 的 height。
+        """
+        canvas.delete("all")
         font = self.fonts["done"] if item["done"] else self.fonts["base"]
         line_h = font.metrics("linespace")
         lines = self._wrap_text(item["text"], font, self.row_wrap)
         row_h = line_h * len(lines) + 2 * self.row_pad_y
+        if int(canvas.cget("height")) != row_h:
+            canvas.configure(height=row_h)
 
-        row = tk.Canvas(self.inner, bg=C_LIST, highlightthickness=0, bd=0,
-                        width=self.list_w, height=row_h, cursor="hand2")
-        row.pack(fill="x")
-
-        self._draw_check(row, item["done"], top=(row_h - self.check_box) // 2)
+        self._draw_check(canvas, item["done"], top=(row_h - self.check_box) // 2)
         for index, line in enumerate(lines):
-            row.create_text(self.text_x, self.row_pad_y + index * line_h, text=line,
-                            anchor="nw",
-                            fill=C_DONE if item["done"] else C_TEXT, font=font)
-        delete_id = row.create_text(self.list_w - self.px(12), row_h // 2 + self.px(1),
-                                    text="×", anchor="e",
-                                    fill=C_MUTED, font=self.fonts["bold"])
+            canvas.create_text(self.text_x, self.row_pad_y + index * line_h, text=line,
+                               anchor="nw",
+                               fill=C_DONE if item["done"] else C_TEXT, font=font)
+        delete_id = canvas.create_text(self.list_w - self.px(12),
+                                       row_h // 2 + self.px(1), text="×", anchor="e",
+                                       fill=C_MUTED, font=self.fonts["bold"])
+        canvas._delete_item = delete_id      # 悬停改色按它取，重画后自动是新 id
+        return delete_id, row_h
+
+    def _redraw_row(self, item_id):
+        """只重画这一行（原地更新），不重建控件。
+
+        勾选以前是 store.toggle() 后 _refresh() 整表重建；而 Tk 判定双击要求两次点击
+        落在同一个控件上——重建后第二次点击只能算「新控件上的单击」，于是
+        <Double-Button-1> 永远不触发，双击改文字在真机上永远进不去。
+        改成原地重画之后，行控件活下来，双击才能按文档那样工作。
+        """
+        widget = self._row_widget(item_id)
+        item = self._find_item(item_id)
+        if widget is None or item is None:
+            return False
+        if self._edit_entry is not None and self._edit_id == item_id:
+            return False                     # 正在编辑这一行，别把它盖掉
+        before = int(widget.cget("height"))
+        self._draw_row(widget, item)
+        if int(widget.cget("height")) != before:
+            self.root.update_idletasks()
+            self._resize()                   # 行高变了才需要重排窗口高度
+        return True
+
+    def _make_row(self, item):
+        row = tk.Canvas(self.inner, bg=C_LIST, highlightthickness=0, bd=0,
+                        width=self.list_w, height=self.px(20), cursor="hand2")
+        row.pack(fill="x")
+        self._draw_row(row, item)
 
         item_id = item["id"]
 
         def on_motion(event):
-            row.itemconfigure(delete_id,
-                              fill=C_DANGER if event.x >= self.list_w - self.del_w else C_MUTED)
+            delete_id = getattr(row, "_delete_item", None)
+            if delete_id is None:
+                return
+            try:
+                row.itemconfigure(delete_id, fill=C_DANGER
+                                  if event.x >= self.list_w - self.del_w else C_MUTED)
+            except tk.TclError:
+                pass
+
+        def on_leave(event):
+            delete_id = getattr(row, "_delete_item", None)
+            if delete_id is None:
+                return
+            try:
+                row.itemconfigure(delete_id, fill=C_MUTED)
+            except tk.TclError:
+                pass
 
         row.bind("<Button-1>", lambda event, i=item_id: self._row_press(event, i))
         row.bind("<B1-Motion>", self._row_motion)
         row.bind("<ButtonRelease-1>", self._row_release)
         row.bind("<Double-Button-1>", lambda event, i=item_id: self._begin_edit(i, event))
         row.bind("<Motion>", on_motion)
-        row.bind("<Leave>", lambda event: row.itemconfigure(delete_id, fill=C_MUTED))
+        row.bind("<Leave>", on_leave)
         self._bind_wheel(row)
 
         self.row_widgets.append((item_id, row))
@@ -1800,6 +1849,8 @@ class TodoWidget(object):
 
     def _update_hint(self):
         """底部提示：折叠时提示展开，条目够多时提示可拖动排序 / 双击可改。"""
+        if self._undo is not None:
+            return                     # 正在显示「已删除…＋撤销」，别把它覆盖掉
         if self.store.ui["collapsed"]:
             text = "双击标题展开"
         elif len(self.store.items) >= 2:
@@ -1911,8 +1962,16 @@ class TodoWidget(object):
         return created
 
     def toggle_item(self, item_id):
-        self.store.toggle(item_id)
-        self._refresh()
+        """勾选 / 取消：只重画这一行，不整表重建（否则双击永远到不了编辑）。"""
+        item = self.store.toggle(item_id)
+        if item is None:
+            return None
+        self._last_toggle = (item_id, time.time())
+        if not self._redraw_row(item_id):
+            self._refresh()
+        self._update_counts()
+        self._update_footer()
+        return item
 
     def remove_item(self, item_id):
         """删除一条：先记下它和原位置，底部留 8 秒撤销窗口。"""
@@ -1954,6 +2013,16 @@ class TodoWidget(object):
             return                         # 双击落在删除区上，不当编辑
         if self._edit_entry is not None:
             self._end_edit(save=True)      # 先收掉上一个
+        # 双击的第一下已经按「单击 = 勾选」处理过了；双击的语义是改文字，
+        # 不该顺手改完成状态，所以这里把那次勾选撤回来。
+        last_id, last_at = self._last_toggle
+        if (event is not None and last_id == item_id
+                and (time.time() - last_at) < DOUBLE_CLICK_REVERT_S):
+            self._last_toggle = (None, 0.0)
+            self.store.toggle(item_id)
+            self._redraw_row(item_id)
+            self._update_counts()
+            self._update_footer()
         widget = self._row_widget(item_id)
         item = self._find_item(item_id)
         if widget is None or item is None:
@@ -2150,9 +2219,38 @@ def run_check():
             if widget._drag_id is not None:
                 problems.append("拖动状态未清理")
             widget._refresh()
-            # 双击编辑：改完要生效（隐藏窗口下不校验几何）
+            # 勾选必须原地重画：行控件对象要活下来，否则 Tk 永远配不出 <Double-Button-1>
+            # （这就是「双击改文字真机上没反应」的根因，用对象同一性在这里卡住）
             target = broken.items[0]
-            widget._begin_edit(target["id"])
+            row_before = widget._row_widget(target["id"])
+            widget.toggle_item(target["id"])
+            if widget._row_widget(target["id"]) is not row_before:
+                problems.append("勾选后行控件被重建了（双击会因此失效）")
+            # 原地重画还得真把内容改掉：勾选框在「已完成」时是 2 个图元（底 + 勾），
+            # 未完成时 1 个（只有边框）。数量不对说明这一行没按新状态重画。
+            expect_marks = 2 if target["done"] else 1
+            if len(row_before.find_withtag("check")) != expect_marks:
+                problems.append("勾选后行内容没有重画（原地更新失效）")
+            if getattr(row_before, "_delete_item", None) is None:
+                problems.append("重画后删除按钮的图元引用丢了")
+            if widget._edit_entry is not None:
+                problems.append("勾选不该进入编辑状态")
+            # 双击手势：第一下按「单击＝勾选」处理，进编辑时要把那一下撤回来，
+            # 且必须真的进入编辑状态（隐藏窗口下用桩事件走 _row_press/_row_release）
+            class _StubEvent(object):
+                def __init__(self, x, y_root=0):
+                    self.x = x
+                    self.y_root = y_root
+
+            done_before = target["done"]
+            body_x = widget.text_x
+            widget._row_press(_StubEvent(x=body_x), target["id"])
+            widget._row_release(_StubEvent(x=body_x))
+            if target["done"] == done_before:
+                problems.append("单击没有切换完成状态")
+            widget._begin_edit(target["id"], _StubEvent(x=body_x))
+            if target["done"] != done_before:
+                problems.append("双击进编辑时没有撤回第一下的勾选")
             if widget._edit_entry is None:
                 problems.append("双击编辑没有进入编辑状态")
             else:
