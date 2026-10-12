@@ -691,6 +691,10 @@ class PlatformBackend(object):
         """开机自启的落点（给人看的字符串）。"""
         return "(当前平台未实现)"
 
+    def app_entry_target(self):
+        """应用菜单条目的落点（Linux 需要它来解析自启项的应用 id）。"""
+        return "(当前平台不适用)"
+
     def autostart_install(self):
         """写入开机自启，返回退出码。"""
         sys.stderr.write("当前平台未实现开机自启\n")
@@ -773,34 +777,60 @@ class X11Backend(PlatformBackend):
         return raise_running_instance()
 
     # ---- 开机自启：~/.config/autostart/*.desktop ----
+    #
+    # Deepin / UOS 上只写 autostart 那条是不够的：startdde 会盯着这个目录，
+    # 新建的条目如果解析不出「应用 id」就会被它删掉（journal 里是
+    # `startmanager.go: RemoveAutostart failed: failed to get app id`），
+    # 实测创建后约 30 秒消失。所以这里同时写一条同名的应用条目到
+    # ~/.local/share/applications/，让 app id（= 文件名）能对上；顺带也给了
+    # 用户一个「应用菜单里点一下就唤回」的入口。
     def autostart_target(self):
         base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
             os.path.expanduser("~"), ".config")
         return os.path.join(base, "autostart", "%s.desktop" % APP_ID)
 
-    def autostart_install(self):
+    def app_entry_target(self):
+        """应用菜单条目的路径（Deepin 靠它解析自启项的应用 id）。"""
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share")
+        return os.path.join(base, "applications", "%s.desktop" % APP_ID)
+
+    def _desktop_entry(self, autostart):
+        """autostart=True 时多带自启相关的键。"""
         script = os.path.abspath(__file__)
-        entry = (
-            "[Desktop Entry]\n"
-            "Type=Application\n"
-            "Name=桌面待办清单\n"
-            "Name[en]=Desktop To-do\n"
-            "Comment=常驻桌面的待办清单挂件\n"
-            "Comment[en]=Always-on-top desktop to-do widget\n"
-            "Exec=%s %s\n"
-            "Icon=checkbox-checked\n"
-            "Terminal=false\n"
-            "Categories=Utility;\n"
-            "StartupNotify=false\n"
-            "X-GNOME-Autostart-enabled=true\n"
-        ) % (sys.executable, script)
-        target = self.autostart_target()
-        directory = os.path.dirname(target)
+        entry = [
+            "[Desktop Entry]",
+            "Type=Application",
+            "Name=桌面待办清单",
+            "Name[en]=Desktop To-do",
+            "Comment=常驻桌面的待办清单挂件",
+            "Comment[en]=Always-on-top desktop to-do widget",
+            "Exec=%s %s" % (sys.executable, script),
+            "Icon=checkbox-checked",
+            "Terminal=false",
+            "Categories=Utility;",
+            "StartupWMClass=%s" % APP_ID,
+            "X-Deepin-AppID=%s" % APP_ID,
+            "X-Deepin-Vendor=user-custom",
+        ]
+        if autostart:
+            entry += ["StartupNotify=false", "X-GNOME-Autostart-enabled=true"]
+        return "\n".join(entry) + "\n"
+
+    def _write_entry(self, path, text):
+        directory = os.path.dirname(path)
         if not os.path.isdir(directory):
             os.makedirs(directory)
-        with open(target, "w", encoding="utf-8") as handle:
-            handle.write(entry)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def autostart_install(self):
+        app_entry = self.app_entry_target()
+        self._write_entry(app_entry, self._desktop_entry(autostart=False))
+        target = self.autostart_target()
+        self._write_entry(target, self._desktop_entry(autostart=True))
         print("已写入开机自启: %s" % target)
+        print("已写入应用菜单条目: %s（Deepin/UOS 用它解析自启项的应用 id）" % app_entry)
         return 0
 
     def autostart_uninstall(self):
@@ -810,6 +840,10 @@ class X11Backend(PlatformBackend):
             print("已移除开机自启: %s" % target)
         else:
             print("未找到开机自启项: %s" % target)
+        app_entry = self.app_entry_target()
+        if os.path.exists(app_entry):
+            os.remove(app_entry)
+            print("已移除应用菜单条目: %s" % app_entry)
         return 0
 
 
@@ -2480,6 +2514,10 @@ def run_doctor():
     else:
         row("path", "单实例套接字", ipc_socket_path())
     row("path", "开机自启", autostart_path())
+    if os.name != "nt":
+        app_entry = get_backend().app_entry_target()
+        row("path", "应用菜单条目", "%s（%s）" % (
+            app_entry, "已存在" if os.path.exists(app_entry) else "不存在"))
 
     # ---- 数据文件（只读）----
     path = data_file()
@@ -2509,6 +2547,22 @@ def run_doctor():
 
     # ---- 单实例 / 唤回 ----
     _doctor_instance(rows, caps)
+
+    # ---- 开机自启：Deepin/UOS 上两个文件必须配套，否则 startdde 会删掉自启项 ----
+    if os.name != "nt" and getattr(get_backend(), "app_entry_target", None) is not None:
+        autostart = autostart_path()
+        app_entry = get_backend().app_entry_target()
+        has_auto = os.path.exists(autostart)
+        has_app = os.path.exists(app_entry)
+        if has_auto and has_app:
+            caps.append(("开机自启", "OK", "自启项 + 应用条目都在"))
+        elif has_auto and not has_app:
+            caps.append(("开机自启", "WARN",
+                         "缺应用条目，Deepin/UOS 的 startdde 会把自启项删掉"))
+        elif has_app and not has_auto:
+            caps.append(("开机自启", "WARN", "有应用条目但还没装自启项"))
+        else:
+            caps.append(("开机自启", "N/A", "尚未安装（--install-autostart）"))
 
     # ---- 窗口能力（需要一个隐藏窗口）----
     root = None
@@ -2628,7 +2682,8 @@ def main(argv=None):
         print("桌面待办清单已经在运行，已把它叫到最前面（任务栏里没有它，这是唤回方式）。")
         return 0
 
-    root = tk.Tk()
+    # WM_CLASS 用 APP_ID，与 .desktop 的 StartupWMClass 对上（Deepin/UOS 靠它认应用）
+    root = tk.Tk(className=APP_ID)
     widget = TodoWidget(root, Store(data_file()))
     if os.environ.get("DESKTOP_TODO_VERBOSE"):
         # 默认不输出；排障时设 DESKTOP_TODO_VERBOSE=1 就能看到托盘有没有挂上

@@ -58,6 +58,16 @@ python3 desktop_todo.py --install-autostart     # 打开
 python3 desktop_todo.py --uninstall-autostart   # 关闭
 ```
 
+> **Deepin / UOS 注意**：这两个平台上只写 autostart 那一条是**留不住的** ——
+> startdde 盯着 `~/.config/autostart`，新建条目如果解析不出「应用 id」就会被它删掉
+> （`journalctl --user | grep autostart` 里是
+> `startmanager.go: RemoveAutostart failed: failed to get app id`，实测创建后约 30 秒消失）。
+> 所以 `--install-autostart` 会**同时**写一条同名的应用条目
+> `~/.local/share/applications/desktop-todo.desktop`（带 `X-Deepin-AppID` 与
+> `StartupWMClass`），让 app id 能对上；顺带也就有了一个「应用菜单里点一下就唤回」的入口。
+> `--uninstall-autostart` 会把两个文件都删掉。`--doctor` 里有一条「开机自启」检查，
+> 缺任一个都会 WARN。
+
 自检（数据读写 + 界面构造 + 拖拽路径 + 双击改名 / 撤销删除，窗口不会显示）：
 
 ```bash
@@ -114,7 +124,7 @@ python3 desktop_todo.py --doctor
 | 唤回（再运行一次） | unix 套接字发 `raise`，窗口 `lift()` + 短暂置顶 + `focus_force()` | 以「窗口还在不在」为准，直接 `FindWindowW` + `SetForegroundWindow` |
 | 托盘图标 | 未实现（仍靠再运行一次唤回） | `Shell_NotifyIcon`：左键唤回 / 右键菜单 |
 | 数据目录 | `$XDG_DATA_HOME` 或 `~/.local/share/desktop-todo` | `%APPDATA%\desktop-todo` |
-| 开机自启 | `~/.config/autostart/desktop-todo.desktop` | `HKCU\...\Run`，用 `pythonw.exe` 启动 |
+| 开机自启 | `~/.config/autostart/desktop-todo.desktop`，**外加** `~/.local/share/applications/desktop-todo.desktop`（Deepin/UOS 的 startdde 要能解析出应用 id，否则会删掉自启项） | `HKCU\...\Run`，用 `pythonw.exe` 启动 |
 | 中文字体 | Noto Sans CJK SC / 思源黑体 / 文泉驿微米黑 | Microsoft YaHei UI |
 | 缩放 | 读 `tk scaling`（跟随 `Xft.dpi`），像素尺寸按同比例放大 | 先声明进程 DPI 感知，再按 `tk scaling` 同比例放大；100% 时逐像素与旧版相同 |
 | `Alt+Tab` | 仍能找到（故意不发 `SKIP_SWITCHER`） | **找不到**（`WS_EX_TOOLWINDOW` 的代价），靠「再运行一次」唤回 |
@@ -185,6 +195,13 @@ python3 desktop_todo.py --doctor
 - `--doctor` 诊断把每个平台能力的**结果**打出来（X11 是写完属性再回读
   `_MOTIF_WM_HINTS` / `_NET_WM_STATE`，Windows 是改完样式再回读 style/exstyle），
   所以「调用没报错、但窗口管理器没接受」这种情况也能看出来。
+- **开机自启（Deepin/UOS）**：`startdde` 会监视 `~/.config/autostart`，新建的条目
+  如果 `getAppIdByFilePath()` 解析不出应用 id，就被它删掉——实测创建后约 30 秒消失，
+  journal 里只有一句 `RemoveAutostart failed: failed to get app id`（连「删掉了」都不直说）。
+  只把文件写进去、不做验证的话，会误以为装好了。因此安装时同时写一条同名的
+  `~/.local/share/applications/*.desktop`（`X-Deepin-AppID` + `StartupWMClass`），
+  并让程序自己的 `wm class` 也是 `desktop-todo`；`--doctor` 加了「自启项 + 应用条目
+  是否配套」的检查。验证方式就是「装完盯 30 秒以上」。
 - 依赖：Python 3 + tkinter（统信 UOS / Deepin 自带；Windows 随 Python 安装包自带）。
   Linux 额外需要 X11 的 `libX11.so.6`（取不到时退化成「带标题栏、任务栏里有图标」
   的普通窗口，待办功能不受影响）；Windows 不需要任何额外依赖，全部走标准库
