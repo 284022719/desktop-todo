@@ -90,6 +90,8 @@ DOUBLE_CLICK_REVERT_S = 0.8   # 双击进入编辑时，把第一次单击的勾
 STATE_TODO = "todo"
 STATE_WAITING = "waiting"
 STATE_DONE = "done"
+# 列表默认排序：未完成 → 等待中 → 已完成（同组内保持手动拖出来的顺序）
+STATE_ORDER = (STATE_TODO, STATE_WAITING, STATE_DONE)
 WAIT_W = 30             # 条目右侧「等待」按钮的点击区宽度（在删除区左边）
 
 C_CARD = "#24272c"     # 卡片底色
@@ -1447,6 +1449,7 @@ class Store(object):
                 })
         if self.items:
             self._next_id = max(item["id"] for item in self.items) + 1
+            self.resort()                     # 默认排序：未完成 → 等待中 → 已完成
 
         ui = raw.get("ui")
         if isinstance(ui, dict):
@@ -1529,6 +1532,20 @@ class Store(object):
         if state in (STATE_TODO, STATE_WAITING, STATE_DONE):
             return state
         return STATE_DONE if item.get("done") else STATE_TODO
+
+    def resort(self, save=False):
+        """按状态分组排序（未完成 → 等待中 → 已完成），返回顺序是否真的变了。
+
+        用稳定排序：同一组里的相对顺序原样保留，所以「拖拽排出来的优先级」不会被它打乱，
+        它只负责把三段归位。列表顺序变了才会写盘。
+        """
+        rank = dict((state, index) for index, state in enumerate(STATE_ORDER))
+        before = [item["id"] for item in self.items]
+        self.items.sort(key=lambda item: rank.get(self.state_of(item), len(STATE_ORDER)))
+        changed = [item["id"] for item in self.items] != before
+        if changed and save:
+            self.save()
+        return changed
 
     def move(self, item_id, index, save=True):
         """把某条挪到列表的第 index 个位置（index 按移动前的列表计算）。
@@ -1621,6 +1638,8 @@ class Store(object):
 class TodoWidget(object):
     """桌面待办面板（无边框、默认不置顶；条目可拖拽排序）。"""
 
+    REGROUP_DELAY_MS = 1200       # 状态变了多久之后把它归位（留出双击改名的窗口）
+
     def __init__(self, root, store, visible=True):
         self.root = root
         self.store = store
@@ -1654,6 +1673,7 @@ class TodoWidget(object):
         self._edit_id = None              # 正在编辑的条目 id
         self._edit_entry = None           # 正在编辑的输入框（盖在那一行上）
         self._last_toggle = (None, 0.0)   # 最近一次勾选（条目 id, 时间），供双击回退
+        self._regroup_job = None          # 归位（按状态分组排序）的待执行任务
         self._build()
         self._restore_position()
         self._apply_collapsed()
@@ -2151,6 +2171,7 @@ class TodoWidget(object):
             self.toggle_item(press["id"])
 
     def _begin_drag(self, item_id):
+        self._cancel_regroup()               # 拖动期间别归位（归位会重建行，拖到一半会乱）
         self._drag_id = item_id
         widget = self._row_widget(item_id)
         if widget is not None:
@@ -2174,6 +2195,7 @@ class TodoWidget(object):
             widget.delete("dragbg")
         self.store.save()                    # 新顺序落盘
         self._refresh()                      # 重画，保持行高/滚动位置一致
+        self._schedule_regroup()             # 万一之前有改过状态还没归位，顺手补上
 
     def _row_widget(self, item_id):
         for row_id, widget in self.row_widgets:
@@ -2182,7 +2204,11 @@ class TodoWidget(object):
         return None
 
     def _drag_to(self, y_root):
-        """把被拖动的条目挪到指针所在的那一行（实时换位，松手才落盘）。"""
+        """把被拖动的条目挪到指针所在的那一行（实时换位，松手才落盘）。
+
+        只在自己那一「段」里换位：默认排序是未完成 → 等待中 → 已完成，拖过界也只贴到
+        本段的头/尾，免得一次拖动就把分组打乱（想换段就点勾选框或小钟）。
+        """
         if not self.row_widgets:
             return
         target = None
@@ -2194,10 +2220,32 @@ class TodoWidget(object):
         if target is None:                   # 拖到列表外：贴到首/尾
             first_top = self.row_widgets[0][1].winfo_rooty()
             target = 0 if y_root < first_top else len(self.row_widgets) - 1
+        target = self._clamp_to_group(self._drag_id, target)
         if target == self._index_of(self._drag_id):
             return
         if self.store.move(self._drag_id, target, save=False):
             self._repack_rows()
+
+    def _clamp_to_group(self, item_id, target):
+        """把落点夹到该条目所在状态段内（默认排序是分段的，拖拽不跨段）。"""
+        low, high = self._group_span(item_id)
+        return max(low, min(int(target), high))
+
+    def _group_span(self, item_id):
+        """被拖条目所在状态段在 row_widgets 里的下标范围（含两端）。"""
+        last = max(0, len(self.row_widgets) - 1)
+        item = self._find_item(item_id)
+        if item is None:
+            return 0, last
+        state = self.store.state_of(item)
+        indexes = []
+        for index, (row_id, _) in enumerate(self.row_widgets):
+            row_item = self._find_item(row_id)
+            if row_item is not None and self.store.state_of(row_item) == state:
+                indexes.append(index)
+        if not indexes:
+            return 0, last
+        return min(indexes), max(indexes)
 
     def _index_of(self, item_id):
         for index, (row_id, _) in enumerate(self.row_widgets):
@@ -2386,6 +2434,7 @@ class TodoWidget(object):
         self._last_toggle = (item_id, time.time())
         if not self._redraw_row(item_id):
             self._refresh()
+        self._schedule_regroup()
         self._update_counts()
         self._update_footer()
         return item
@@ -2401,9 +2450,42 @@ class TodoWidget(object):
             return None
         if not self._redraw_row(item_id):
             self._refresh()
+        self._schedule_regroup()
         self._update_counts()
         self._update_footer()
         return item
+
+    # ---- 归位（默认排序：未完成 → 等待中 → 已完成）----
+    def _schedule_regroup(self):
+        """状态变了先别急着把它挪到别的段去，等用户停手再归位。
+
+        原因和「双击改名」直接相关：双击的第一下按单击处理会改状态，如果这一下就让整行
+        飞到列表底部，第二下就落到别的行上了 —— Tk 判定双击要求两次点击在同一个控件上，
+        编辑框再也打不开。所以归位推迟到 REGROUP_DELAY_MS 之后，且在拖动/编辑/按住时顺延。
+        """
+        self._cancel_regroup()
+        try:
+            self._regroup_job = self.root.after(self.REGROUP_DELAY_MS, self._regroup_now)
+        except tk.TclError:
+            self._regroup_job = None
+
+    def _cancel_regroup(self):
+        if self._regroup_job is not None:
+            job, self._regroup_job = self._regroup_job, None
+            try:
+                self.root.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
+
+    def _regroup_now(self):
+        """把列表按状态归位；用户正在操作时顺延，别抢他的鼠标。"""
+        self._regroup_job = None
+        if self._drag_id is not None or self._press is not None \
+                or self._edit_entry is not None:
+            self._schedule_regroup()
+            return
+        if self.store.resort(save=True):
+            self._refresh()
 
     def remove_item(self, item_id):
         """删除一条：先记下它和原位置，底部留 8 秒撤销窗口。"""
@@ -2443,6 +2525,7 @@ class TodoWidget(object):
         """双击条目：在那一行上盖一个输入框；回车保存、Esc 取消、点到别处也算保存。"""
         if event is not None and event.x >= self.list_w - self.del_w - self.wait_w:
             return                         # 双击落在删除区/「等待」按钮上，不当编辑
+        self._cancel_regroup()             # 编辑期间不归位：_refresh() 会把输入框一起销毁
         if self._edit_entry is not None:
             self._end_edit(save=True)      # 先收掉上一个
         # 双击的第一下已经按「单击 = 勾选」处理过了；双击的语义是改文字，
@@ -2496,6 +2579,7 @@ class TodoWidget(object):
             pass
         changed = self.store.rename(item_id, text) if save else False
         self._refresh()
+        self._schedule_regroup()             # 编辑结束再归位（编辑中归位会把输入框销毁）
         return changed
 
     def clear_done(self):
@@ -2526,9 +2610,11 @@ class TodoWidget(object):
         except tk.TclError:
             pass
         self._stop_autoscroll()
+        self._cancel_regroup()
         self.backend.hotkey_remove()              # 解掉全局快捷键（不然退出后那个键还空占着）
         self.backend.tray_remove(self.root)       # 先摘托盘图标并还原窗口过程
         self.backend.single_instance_stop(self.root)
+        self.store.resort()                       # 退出前把顺序归位，文件里也是分好组的
         self.store.save()
         self.root.destroy()
 
@@ -2613,9 +2699,51 @@ def run_check():
             json.dump({"items": [{"id": 1, "text": "老格式已完成", "done": True},
                                  {"id": 2, "text": "老格式未完成", "done": False}]}, handle)
         legacy = Store(legacy_path)
-        legacy_states = [legacy.state_of(item) for item in legacy.items]
-        if legacy_states != [STATE_DONE, STATE_TODO]:
+        legacy_states = dict((item["text"], legacy.state_of(item)) for item in legacy.items)
+        if legacy_states.get("老格式已完成") != STATE_DONE \
+                or legacy_states.get("老格式未完成") != STATE_TODO:
             problems.append("旧格式数据没有正确推断状态: %r" % (legacy_states,))
+        if [item["text"] for item in legacy.items] != ["老格式未完成", "老格式已完成"]:
+            problems.append("旧格式数据读进来没有按状态归位: %r"
+                            % ([item["text"] for item in legacy.items],))
+
+        # ---- 默认排序：未完成 → 等待中 → 已完成（同组内保持手动顺序）----
+        order = Store(os.path.join(temp_dir, "order.json"))
+        a = order.add("A")            # 顺序：A B C D（新增插到最前）
+        b = order.add("B")
+        c = order.add("C")
+        d = order.add("D")
+        order.toggle(d["id"])                    # D 已完成
+        order.toggle_waiting(c["id"])            # C 等待中
+        order.resort()
+        got_order = [item["text"] for item in order.items]
+        if got_order != ["B", "A", "C", "D"]:
+            problems.append("归位后顺序不对（期望 未完成B,A → 等待中C → 已完成D）: %r" % (got_order,))
+        if order.resort():
+            problems.append("已经排好序的列表再排一次不该有变化")
+        # 同组内手动顺序要保住：把 A 拖到 B 前面
+        order.move(a["id"], 0)
+        order.resort()
+        if [item["text"] for item in order.items] != ["A", "B", "C", "D"]:
+            problems.append("归位把同组内拖出来的顺序打乱了: %r"
+                            % ([item["text"] for item in order.items],))
+        order.save()
+        if [item["text"] for item in Store(os.path.join(temp_dir, "order.json")).items] \
+                != ["A", "B", "C", "D"]:
+            problems.append("归位后的顺序没有落盘")
+        messy_path = os.path.join(temp_dir, "messy.json")
+        with open(messy_path, "w", encoding="utf-8") as handle:
+            json.dump({"items": [
+                {"id": 1, "text": "已完成", "done": True},
+                {"id": 2, "text": "未完成1", "done": False},
+                {"id": 3, "text": "已完成2", "done": True},
+                {"id": 4, "text": "未完成2", "done": False},
+            ]}, handle)
+        messy = Store(messy_path)
+        if [item["text"] for item in messy.items] != \
+                ["未完成1", "未完成2", "已完成", "已完成2"]:
+            problems.append("乱序的老数据读进来没有归位: %r"
+                            % ([item["text"] for item in messy.items],))
 
         reloaded.ui.update({"x": 123, "y": 45, "collapsed": True, "alpha": 0.82})
         reloaded.save()
@@ -2777,12 +2905,72 @@ def run_check():
             if Store(path).state_of(
                     [i for i in Store(path).items if i["id"] == target["id"]][0]) != STATE_TODO:
                 problems.append("等待状态没有落盘")
+            # ---- 默认排序：未完成 → 等待中 → 已完成 ----
+            for entry in list(broken.items):          # 先把状态归一，免得受前面用例影响
+                if broken.state_of(entry) == STATE_WAITING:
+                    broken.toggle_waiting(entry["id"])
+                elif broken.state_of(entry) == STATE_DONE:
+                    broken.toggle(entry["id"])
+            widget._refresh()
+            widget._cancel_regroup()                  # 先清干净，免得受前面用例遗留的任务影响
+            first_todo = broken.items[0]
+            order_before = [entry["id"] for entry in broken.items]
+            widget.toggle_item(first_todo["id"])
+            if [entry["id"] for entry in broken.items] != order_before:
+                problems.append("勾选后立刻就把行挪走了（双击改名会因此落空）")
+            if widget._regroup_job is None:
+                problems.append("勾选后没有安排归位")
+            widget._regroup_now()
+            if broken.state_of(broken.items[-1]) != STATE_DONE:
+                problems.append("归位后已完成条目不在最后: %r"
+                                % ([broken.state_of(e) for e in broken.items],))
+            if widget._regroup_job is not None:
+                problems.append("归位之后还留着待执行任务")
+            # 拖拽不跨段：落点被夹在本状态段内
+            widget._refresh()
+            todo_items = [e for e in broken.items if broken.state_of(e) == STATE_TODO]
+            done_indexes = [i for i, e in enumerate(broken.items)
+                            if broken.state_of(e) == STATE_DONE]
+            if todo_items and done_indexes:
+                if widget._clamp_to_group(todo_items[0]["id"], 999) >= done_indexes[0]:
+                    problems.append("拖拽落点没有被限制在本状态段内")
+                if widget._clamp_to_group(todo_items[0]["id"], -5) != 0:
+                    problems.append("拖拽落点下界没有被夹住")
+                # 真拖一次：往「已完成」那一段里拖，不能跨过去（跨段只能靠勾选/小钟）
+                dragged = todo_items[0]["id"]
+                done_row = widget._row_widget(broken.items[done_indexes[0]]["id"])
+                widget._begin_drag(dragged)
+                widget._drag_to(done_row.winfo_rooty() + 1)
+                widget._end_drag()
+                after_items = list(broken.items)
+                dragged_at = [i for i, e in enumerate(after_items) if e["id"] == dragged]
+                done_first = [i for i, e in enumerate(after_items)
+                              if broken.state_of(e) == STATE_DONE]
+                if dragged_at and done_first and dragged_at[0] >= done_first[0]:
+                    problems.append("拖拽把条目拖进了别的状态段: %r"
+                                    % ([e["text"] for e in after_items],))
+            # 编辑期间不归位（归位会重建行、把输入框一起销毁）
+            edit_target = [e for e in broken.items if broken.state_of(e) == STATE_TODO]
+            if edit_target:
+                edit_id = edit_target[0]["id"]
+                widget.toggle_item(edit_id)           # 变成已完成，安排归位
+                widget._begin_edit(edit_id, _StubEvent(x=body_x))
+                if widget._regroup_job is not None:
+                    problems.append("进入编辑时没有取消失效的归位任务")
+                widget._regroup_now()                 # 编辑中触发：应顺延，不该重画
+                if widget._edit_entry is None:
+                    problems.append("编辑中触发归位把输入框销毁了")
+                if widget._regroup_job is None:
+                    problems.append("编辑中触发归位后没有顺延")
+                widget._end_edit(save=False)
             root.update()
             root.withdraw()
             root.update()
             root.destroy()
         except Exception as error:      # 不限于 TclError：代码里的笔误也要在这里暴露
-            problems.append("界面/拖拽自检失败: %r" % (error,))
+            import traceback
+            problems.append("界面/拖拽自检失败: %r\n%s"
+                            % (error, traceback.format_exc()))
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
