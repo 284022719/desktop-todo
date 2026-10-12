@@ -3105,8 +3105,9 @@ def run_doctor():
         else:
             row("hotkey", "全局快捷键", "%s（%s）" % (
                 format_hotkey(hotkey_spec),
-                "注册成功" if installed else "没注册上：可能被别的程序占了，可换一个 "
-                "(--hotkey Ctrl+Alt+K)"))
+                "注册成功" if installed else
+                "没注册上：要么已经有实例在跑（它正占着这个键），要么被别的程序占了；"
+                "换一个用 --hotkey Ctrl+Alt+K"))
             caps.append(("全局快捷键", "OK" if installed else "WARN",
                          format_hotkey(hotkey_spec)))
         try:
