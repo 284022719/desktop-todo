@@ -92,7 +92,13 @@ STATE_WAITING = "waiting"
 STATE_DONE = "done"
 # 列表默认排序：未完成 → 等待中 → 已完成（同组内保持手动拖出来的顺序）
 STATE_ORDER = (STATE_TODO, STATE_WAITING, STATE_DONE)
-WAIT_W = 30             # 条目右侧「等待」按钮的点击区宽度（在删除区左边）
+WAIT_W = 30             # 条目右侧「等待」按钮的点击区宽度
+TODAY_W = 26            # 条目右侧「今天」按钮的点击区宽度
+PRIO_W = 26             # 条目右侧「优先级」按钮的点击区宽度
+
+# 优先级：0 无 / 1 中 / 2 高（值越大越靠前）；点一下按这个顺序循环
+PRIORITY_NONE, PRIORITY_MID, PRIORITY_HIGH = 0, 1, 2
+PRIORITY_CYCLE = (PRIORITY_NONE, PRIORITY_HIGH, PRIORITY_MID)
 
 C_CARD = "#24272c"     # 卡片底色
 C_LIST = "#1d2024"     # 输入框 / 列表底色
@@ -105,6 +111,7 @@ C_DANGER = "#e5695f"   # 删除悬停
 C_HOVER = "#2e333a"    # 拖动中的条目底色
 C_DONE = "#7b828c"     # 已完成文字
 C_WAIT = "#e0a33e"     # 等待中文字 / 图标
+C_HIGH = "#ff7a59"     # 高优先级旗子
 
 PLACEHOLDER = "添加一条待办，回车确认"
 FONT_STACK = (
@@ -1441,11 +1448,18 @@ class Store(object):
                 state = str(entry.get("state") or "")
                 if state not in (STATE_TODO, STATE_WAITING, STATE_DONE):
                     state = STATE_DONE if done else STATE_TODO
+                try:
+                    priority = int(entry.get("priority") or 0)
+                except (TypeError, ValueError):
+                    priority = PRIORITY_NONE
                 self.items.append({
                     "id": item_id,
                     "text": text,
                     "done": state == STATE_DONE,
                     "state": state,
+                    "priority": priority if priority in (PRIORITY_NONE, PRIORITY_MID,
+                                                        PRIORITY_HIGH) else PRIORITY_NONE,
+                    "today": bool(entry.get("today")),
                     "created": float(entry.get("created") or time.time()),
                 })
         if self.items:
@@ -1500,7 +1514,8 @@ class Store(object):
         if not text:
             return None
         item = {"id": self._next_id, "text": text, "done": False,
-                "state": STATE_TODO, "created": time.time()}
+                "state": STATE_TODO, "priority": PRIORITY_NONE, "today": False,
+                "created": time.time()}
         self._next_id += 1
         self.items.insert(0, item)
         self.save()
@@ -1531,6 +1546,41 @@ class Store(object):
                     item, STATE_TODO if state == STATE_WAITING else STATE_WAITING)
         return None
 
+    def priority_of(self, item):
+        """取优先级（兼容没有这个字段的老数据）。"""
+        value = item.get("priority")
+        return value if value in (PRIORITY_NONE, PRIORITY_MID, PRIORITY_HIGH) \
+            else PRIORITY_NONE
+
+    def cycle_priority(self, item_id):
+        """点旗子：无 → 高 → 中 → 无。"""
+        for item in self.items:
+            if item["id"] == item_id:
+                current = self.priority_of(item)
+                try:
+                    index = PRIORITY_CYCLE.index(current)
+                except ValueError:
+                    index = 0
+                item["priority"] = PRIORITY_CYCLE[(index + 1) % len(PRIORITY_CYCLE)]
+                self.save()
+                return item
+        return None
+
+    def toggle_today(self, item_id):
+        """标记 / 取消「今天要办的」。"""
+        for item in self.items:
+            if item["id"] == item_id:
+                item["today"] = not bool(item.get("today"))
+                self.save()
+                return item
+        return None
+
+    def today_stats(self):
+        """(今天已做完数, 今天标记总数)。"""
+        marked = [item for item in self.items if item.get("today")]
+        done = len([item for item in marked if self.state_of(item) == STATE_DONE])
+        return done, len(marked)
+
     def state_of(self, item):
         """取条目状态（兼容老数据：只认 done 的条目）。"""
         state = item.get("state")
@@ -1545,8 +1595,19 @@ class Store(object):
         它只负责把三段归位。列表顺序变了才会写盘。
         """
         rank = dict((state, index) for index, state in enumerate(STATE_ORDER))
+
+        def sort_key(pair):
+            index, item = pair
+            state = self.state_of(item)
+            state_rank = rank.get(state, len(STATE_ORDER))
+            # 段内：先「今天要办的」（已完成的不参与置顶），再优先级，最后是原来的手动顺序
+            today_rank = 0 if (item.get("today") and state != STATE_DONE) else 1
+            priority_rank = -self.priority_of(item)
+            return (state_rank, today_rank, priority_rank, index)
+
         before = [item["id"] for item in self.items]
-        self.items.sort(key=lambda item: rank.get(self.state_of(item), len(STATE_ORDER)))
+        order = sorted(enumerate(self.items), key=sort_key)
+        self.items = [item for _, item in order]
         changed = [item["id"] for item in self.items] != before
         if changed and save:
             self.save()
@@ -1662,10 +1723,15 @@ class TodoWidget(object):
         self.text_x = _scaled(TEXT_X, scale)
         self.del_w = _scaled(DEL_W, scale)
         self.wait_w = _scaled(WAIT_W, scale)
+        self.today_w = _scaled(TODAY_W, scale)
+        self.prio_w = _scaled(PRIO_W, scale)
+        # 右侧按钮：从右往左排（区名, 宽度）。绘制、点击判定、折行宽度共用这一张表
+        self.markers = (("delete", self.del_w), ("wait", self.wait_w),
+                        ("today", self.today_w), ("prio", self.prio_w))
+        self.marker_w = sum(width for _, width in self.markers)
         self.row_pad_y = _scaled(ROW_PAD_Y, scale)
         self.row_wrap = max(_scaled(40, scale),
-                            self.list_w - self.text_x - self.del_w - self.wait_w
-                            - _scaled(4, scale))
+                            self.list_w - self.text_x - self.marker_w - _scaled(4, scale))
         self.header_h = _scaled(34, scale)
         self.icon_box = _scaled(20, scale)
         self.check_box = _scaled(16, scale)
@@ -1824,6 +1890,7 @@ class TodoWidget(object):
             "bold": tkfont.Font(family=actual, size=10, weight="bold"),
             "small": tkfont.Font(family=actual, size=9),
             "done": tkfont.Font(family=actual, size=10, overstrike=1),
+            "marker": tkfont.Font(family=actual, size=8),
         }
 
     # ---- 组装 ----
@@ -2095,17 +2162,20 @@ class TodoWidget(object):
     def _draw_row(self, canvas, item):
         """把一条待办画进行画布（新建与原地重画共用）。
 
-        三种状态的视觉：
-          未完成 = 白字 + 空方框；
-          等待中 = 琥珀字 + 琥珀小钟（已经着手，但在等别人反馈，现在自己动不了）；
-          已完成 = 灰字加删除线 + 蓝勾。
+        视觉上的几个维度：
+          状态：未完成＝白字空方框；等待中＝琥珀字 + 琥珀小钟；已完成＝灰字删除线 + 蓝勾；
+          优先级：右侧旗子（实心橙＝高、空心橙＝中、淡灰＝无）；
+          今天：右侧「今」（蓝色＝今天要办的）；
+          删除：最右边那个 ×。
 
         返回 (删除按钮的图元 id, 行高)；行高变化时会同步 canvas 的 height。
         """
         canvas.delete("all")
         state = self.store.state_of(item)
         done = state == STATE_DONE
-        waiting = state == STATE_WAITING
+        canvas._waiting = state == STATE_WAITING
+        canvas._prio = self.store.priority_of(item)
+        canvas._today = bool(item.get("today"))
         font = self.fonts["done"] if done else self.fonts["base"]
         line_h = font.metrics("linespace")
         lines = self._wrap_text(item["text"], font, self.row_wrap)
@@ -2114,38 +2184,131 @@ class TodoWidget(object):
             canvas.configure(height=row_h)
 
         self._draw_check(canvas, done, top=(row_h - self.check_box) // 2)
-        text_color = C_DONE if done else (C_WAIT if waiting else C_TEXT)
+        text_color = C_DONE if done else (C_WAIT if canvas._waiting else C_TEXT)
         for index, line in enumerate(lines):
             canvas.create_text(self.text_x, self.row_pad_y + index * line_h, text=line,
                                anchor="nw", fill=text_color, font=font)
-        self._draw_wait_icon(canvas, waiting, row_h)
-        delete_id = canvas.create_text(self.list_w - self.px(12),
-                                       row_h // 2 + self.px(1), text="×", anchor="e",
-                                       fill=C_MUTED, font=self.fonts["bold"])
-        canvas._delete_item = delete_id      # 悬停改色按它取，重画后自动是新 id
-        return delete_id, row_h
+        canvas._markers = {
+            "prio": self._draw_prio_marker(canvas, row_h),
+            "today": self._draw_today_marker(canvas, row_h),
+            "wait": self._draw_wait_marker(canvas, row_h),
+            "delete": self._draw_delete_marker(canvas, row_h),
+        }
+        canvas._delete_item = canvas._markers["delete"][0][0]   # 兼容旧引用
+        self._paint_markers(canvas, None)
+        return canvas._delete_item, row_h
 
-    def _draw_wait_icon(self, canvas, waiting, row_h):
-        """「等待中」按钮：画一个小钟（琥珀＝已标记等待，灰＝未标记）。
+    # ---- 右侧按钮：位置、绘制、上色 ----
+    def _marker_center(self, zone, row_h):
+        """某个右侧按钮的中心坐标（按钮从右往左排）。"""
+        right = self.list_w
+        for name, width in self.markers:
+            if name == zone:
+                return right - width / 2.0, row_h // 2.0 + self.px(1)
+            right -= width
+        return right, row_h // 2.0 + self.px(1)
 
-        用 Canvas 图元画而不是 ⏳ 这类字符：符号在不同字体下的宽度/字形不可控，
-        而且这里要能单独改色做悬停反馈。三个图元都带 wait 标签，便于整体改色与自检。
-        """
-        size = float(self.px(12))
-        radius = size / 2.0
-        cx = self.list_w - self.del_w - self.wait_w / 2.0
-        cy = row_h // 2.0 + self.px(1)
-        color = C_WAIT if waiting else C_MUTED
+    def _marker_zone_start(self):
+        """右侧按钮区的左边界（点击落在这右边就不算"点条目本身"）。"""
+        return self.list_w - self.marker_w
+
+    def _zone_at(self, x):
+        """x 落在哪个右侧按钮上；不在按钮区返回 None。"""
+        right = self.list_w
+        for name, width in self.markers:
+            if x >= right - width:
+                return name
+            right -= width
+        return None
+
+    def _draw_prio_marker(self, canvas, row_h):
+        """优先级旗子：一根杆 + 一面三角形旗（实心/空心由 _paint_markers 决定）。"""
+        cx, cy = self._marker_center("prio", row_h)
+        size = float(self.px(11))
+        width = max(1.0, self.s)
+        pole_x = cx - size * 0.36
+        top = cy - size * 0.5
+        bottom = cy + size * 0.55
+        pole = canvas.create_line(pole_x, top, pole_x, bottom, width=width,
+                                  capstyle="round", tags="marker")
+        flag = canvas.create_polygon(pole_x, top + size * 0.02,
+                                     pole_x + size * 0.72, top + size * 0.26,
+                                     pole_x, top + size * 0.5,
+                                     outline=C_MUTED, fill="", width=width,
+                                     tags="marker")
+        return ((pole, "line"), (flag, "poly"))
+
+    def _draw_today_marker(self, canvas, row_h):
+        """「今天要办的」按钮：画一个「今」字（比画图形更好认，也不依赖 emoji 字体）。"""
+        cx, cy = self._marker_center("today", row_h)
+        text_id = canvas.create_text(cx, cy, text="今", fill=C_MUTED,
+                                     font=self.fonts["marker"], tags="marker")
+        return ((text_id, "text"),)
+
+    def _draw_wait_marker(self, canvas, row_h):
+        """「等待中」按钮：一个小钟（圆环 + 两根指针）。"""
+        cx, cy = self._marker_center("wait", row_h)
+        radius = float(self.px(6))
         width = max(1.0, self.s)
         ring = canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
-                                  outline=color, width=width, tags="wait")
-        hand_h = canvas.create_line(cx, cy, cx, cy - radius * 0.55, fill=color,
-                                    width=width, capstyle="round", tags="wait")
+                                  outline=C_MUTED, width=width, tags="marker")
+        hand_h = canvas.create_line(cx, cy, cx, cy - radius * 0.55, width=width,
+                                    capstyle="round", tags="marker")
         hand_m = canvas.create_line(cx, cy, cx + radius * 0.5, cy + radius * 0.35,
-                                    fill=color, width=width, capstyle="round", tags="wait")
-        canvas._wait_items = (ring, hand_h, hand_m)
-        canvas._wait_base = color            # 未悬停时的底色，悬停反馈按它取
-        return ring
+                                    width=width, capstyle="round", tags="marker")
+        return ((ring, "oval"), (hand_h, "line"), (hand_m, "line"))
+
+    def _draw_delete_marker(self, canvas, row_h):
+        """删除按钮：×（原来那个位置和判定都没变）。"""
+        cx, cy = self._marker_center("delete", row_h)
+        text_id = canvas.create_text(cx, cy, text="×", fill=C_MUTED,
+                                     font=self.fonts["bold"], tags="marker")
+        return ((text_id, "text"),)
+
+    def _colorize(self, canvas, items, color, filled=False):
+        """给一组图元上色：圆环改 outline、三角旗改 outline+fill、其余改 fill。"""
+        for item_id, kind in items:
+            try:
+                if kind == "oval":
+                    canvas.itemconfigure(item_id, outline=color)
+                elif kind == "poly":
+                    canvas.itemconfigure(item_id, outline=color,
+                                         fill=color if filled else "")
+                else:
+                    canvas.itemconfigure(item_id, fill=color)
+            except tk.TclError:
+                return
+
+    def _paint_markers(self, canvas, hover_zone):
+        """按状态 + 悬停给右侧按钮上色（悬停时预演"点下去会变成什么"）。"""
+        markers = getattr(canvas, "_markers", None)
+        if not markers:
+            return
+        priority = getattr(canvas, "_prio", PRIORITY_NONE)
+        if priority == PRIORITY_HIGH:
+            color, filled = C_HIGH, True
+        elif priority == PRIORITY_MID:
+            color, filled = C_HIGH, False
+        else:
+            color, filled = C_MUTED, False
+        if hover_zone == "prio":
+            color, filled = C_HIGH, priority != PRIORITY_HIGH
+        self._colorize(canvas, markers["prio"], color, filled)
+
+        marked = bool(getattr(canvas, "_today", False))
+        color = C_ACCENT if marked else C_MUTED
+        if hover_zone == "today":
+            color = C_MUTED if marked else C_ACCENT
+        self._colorize(canvas, markers["today"], color)
+
+        waiting = bool(getattr(canvas, "_waiting", False))
+        color = C_WAIT if waiting else C_MUTED
+        if hover_zone == "wait":
+            color = C_MUTED if waiting else C_WAIT
+        self._colorize(canvas, markers["wait"], color)
+
+        self._colorize(canvas, markers["delete"],
+                       C_DANGER if hover_zone == "delete" else C_MUTED)
 
     def _redraw_row(self, item_id):
         """只重画这一行（原地更新），不重建控件。
@@ -2176,38 +2339,11 @@ class TodoWidget(object):
 
         item_id = item["id"]
 
-        def set_wait_color(color):
-            """改小钟颜色：圆环改 outline，指针改 fill。"""
-            for item_id in getattr(row, "_wait_items", ()) or ():
-                try:
-                    if row.type(item_id) == "oval":
-                        row.itemconfigure(item_id, outline=color)
-                    else:
-                        row.itemconfigure(item_id, fill=color)
-                except tk.TclError:
-                    return
-
         def on_motion(event):
-            delete_id = getattr(row, "_delete_item", None)
-            over_delete = event.x >= self.list_w - self.del_w
-            over_wait = (not over_delete) and event.x >= self.list_w - self.del_w - self.wait_w
-            try:
-                if delete_id is not None:
-                    row.itemconfigure(delete_id, fill=C_DANGER if over_delete else C_MUTED)
-            except tk.TclError:
-                pass
-            # 悬停时显示「点下去会变成什么」：未标记的亮成琥珀，已标记的暗下去
-            base = getattr(row, "_wait_base", C_MUTED)
-            set_wait_color((C_MUTED if base == C_WAIT else C_WAIT) if over_wait else base)
+            self._paint_markers(row, self._zone_at(event.x))
 
         def on_leave(event):
-            try:
-                delete_id = getattr(row, "_delete_item", None)
-                if delete_id is not None:
-                    row.itemconfigure(delete_id, fill=C_MUTED)
-            except tk.TclError:
-                pass
-            set_wait_color(getattr(row, "_wait_base", C_MUTED))
+            self._paint_markers(row, None)
 
         row.bind("<Button-1>", lambda event, i=item_id: self._row_press(event, i))
         row.bind("<B1-Motion>", self._row_motion)
@@ -2221,14 +2357,9 @@ class TodoWidget(object):
 
     # ---- 条目拖拽排序 ----
     def _row_press(self, event, item_id):
-        """记住按下的位置：右侧 × 算删除，× 左边的时钟算「等待」，其余当可能的点击/拖拽。"""
-        if event.x >= self.list_w - self.del_w:
-            zone = "delete"
-        elif event.x >= self.list_w - self.del_w - self.wait_w:
-            zone = "wait"
-        else:
-            zone = "body"
-        self._press = {"id": item_id, "y": event.y_root, "zone": zone}
+        """记住按下的位置：右侧四个按钮各自成区，其余当"点条目本身"（勾选/拖拽）。"""
+        self._press = {"id": item_id, "y": event.y_root,
+                       "zone": self._zone_at(event.x) or "body"}
 
     def _row_motion(self, event):
         if self._press is None:
@@ -2249,14 +2380,20 @@ class TodoWidget(object):
             return
         if press is None:
             return
-        if press["zone"] == "delete":
-            if event.x >= self.list_w - self.del_w:    # 松手时指针仍在 × 上才算删除
-                self.remove_item(press["id"])
-        elif press["zone"] == "wait":
-            if event.x >= self.list_w - self.del_w - self.wait_w:   # 松手时仍落在时钟上
-                self.toggle_waiting_item(press["id"])
-        else:
+        zone = press["zone"]
+        if zone == "body":
             self.toggle_item(press["id"])
+            return
+        if self._zone_at(event.x) != zone:
+            return                       # 松手时指针得还在同一个按钮上才算数
+        if zone == "delete":
+            self.remove_item(press["id"])
+        elif zone == "wait":
+            self.toggle_waiting_item(press["id"])
+        elif zone == "today":
+            self.toggle_today_item(press["id"])
+        elif zone == "prio":
+            self.cycle_priority_item(press["id"])
 
     def _begin_drag(self, item_id):
         self._cancel_regroup()               # 拖动期间别归位（归位会重建行，拖到一半会乱）
@@ -2319,17 +2456,27 @@ class TodoWidget(object):
         low, high = self._group_span(item_id)
         return max(low, min(int(target), high))
 
+    def _bucket_of(self, item):
+        """排序桶：状态 → 是否今天 → 优先级。排序键就是这三样，拖拽也只在桶内换位。"""
+        state = self.store.state_of(item)
+        today_rank = 0 if (item.get("today") and state != STATE_DONE) else 1
+        return (state, today_rank, -self.store.priority_of(item))
+
     def _group_span(self, item_id):
-        """被拖条目所在状态段在 row_widgets 里的下标范围（含两端）。"""
+        """被拖条目所在「桶」在 row_widgets 里的下标范围（含两端）。
+
+        桶 = 状态 + 是否今天 + 优先级。拖拽只在这个范围里换位，免得松手一归位就被弹回去
+        （想换桶就去点勾选框 / 小钟 / 今 / 旗子）。
+        """
         last = max(0, len(self.row_widgets) - 1)
         item = self._find_item(item_id)
         if item is None:
             return 0, last
-        state = self.store.state_of(item)
+        key = self._bucket_of(item)
         indexes = []
         for index, (row_id, _) in enumerate(self.row_widgets):
             row_item = self._find_item(row_id)
-            if row_item is not None and self.store.state_of(row_item) == state:
+            if row_item is not None and self._bucket_of(row_item) == key:
                 indexes.append(index)
         if not indexes:
             return 0, last
@@ -2406,6 +2553,10 @@ class TodoWidget(object):
             return                     # 正在显示「已删除…＋撤销」，别把它覆盖掉
         if self.store.ui["collapsed"]:
             text = "双击标题展开"
+        elif self.store.today_stats()[1]:
+            done, total = self.store.today_stats()
+            self.hint.configure(text="今天 %d/%d" % (done, total), fg=C_ACCENT)
+            return
         elif len(self.store.items) >= 2:
             text = "拖动可排序，双击可改"
         else:
@@ -2555,6 +2706,27 @@ class TodoWidget(object):
         self._update_footer()
         return item
 
+    def cycle_priority_item(self, item_id):
+        """点旗子：无 → 高 → 中 → 无。排序会变，所以照例延迟归位。"""
+        item = self.store.cycle_priority(item_id)
+        if item is None:
+            return None
+        if not self._redraw_row(item_id):
+            self._refresh()
+        self._schedule_regroup()
+        return item
+
+    def toggle_today_item(self, item_id):
+        """标记 / 取消「今天要办的」：会浮到本段最前，所以也延迟归位。"""
+        item = self.store.toggle_today(item_id)
+        if item is None:
+            return None
+        if not self._redraw_row(item_id):
+            self._refresh()
+        self._schedule_regroup()
+        self._update_footer()             # 底部「今天 x/y」要跟着变
+        return item
+
     # ---- 归位（默认排序：未完成 → 等待中 → 已完成）----
     def _schedule_regroup(self):
         """状态变了先别急着把它挪到别的段去，等用户停手再归位。
@@ -2623,8 +2795,8 @@ class TodoWidget(object):
 
     def _begin_edit(self, item_id, event=None):
         """双击条目：在那一行上盖一个输入框；回车保存、Esc 取消、点到别处也算保存。"""
-        if event is not None and event.x >= self.list_w - self.del_w - self.wait_w:
-            return                         # 双击落在删除区/「等待」按钮上，不当编辑
+        if event is not None and event.x >= self._marker_zone_start():
+            return                         # 双击落在右侧按钮上，不当编辑
         self._cancel_regroup()             # 编辑期间不归位：_refresh() 会把输入框一起销毁
         if self._edit_entry is not None:
             self._end_edit(save=True)      # 先收掉上一个
@@ -2825,6 +2997,57 @@ def run_check():
         if parse_hotkey("Super+T") != parse_hotkey("super-t"):
             problems.append("快捷键对大小写和连字符应当等价")
 
+        # ---- 优先级 / 「今天要办的」----
+        marks = Store(os.path.join(temp_dir, "marks.json"))
+        m1 = marks.add("第一条")          # 新增插到最前，所以列表顺序是 [第二条, 第一条]
+        m2 = marks.add("第二条")
+        if marks.priority_of(m1) != PRIORITY_NONE or m1.get("today"):
+            problems.append("新条目的优先级/今天标记默认值不对")
+        marks.cycle_priority(m1["id"])     # 无 → 高
+        if marks.priority_of(m1) != PRIORITY_HIGH:
+            problems.append("点一下旗子应该是高: %r" % (marks.priority_of(m1),))
+        marks.cycle_priority(m1["id"])     # 高 → 中
+        if marks.priority_of(m1) != PRIORITY_MID:
+            problems.append("再点一下应该是中: %r" % (marks.priority_of(m1),))
+        marks.cycle_priority(m1["id"])     # 中 → 无
+        if marks.priority_of(m1) != PRIORITY_NONE:
+            problems.append("第三下应该回到无: %r" % (marks.priority_of(m1),))
+        if marks.cycle_priority(999999) is not None:
+            problems.append("给不存在的条目设优先级应返回 None")
+        # 「今天」要把老的那条顶到本段最前
+        marks.toggle_today(m1["id"])
+        if not m1.get("today") or marks.today_stats() != (0, 1):
+            problems.append("「今天」标记或统计不对: %r %r"
+                            % (m1.get("today"), marks.today_stats()))
+        marks.resort()
+        if [i["text"] for i in marks.items] != ["第一条", "第二条"]:
+            problems.append("「今天」没有排在段内最前: %r"
+                            % ([i["text"] for i in marks.items],))
+        # 同为今天时先看优先级：给第二条高，它应该回到最前
+        marks.cycle_priority(m2["id"])
+        marks.toggle_today(m2["id"])
+        marks.resort()
+        if [i["text"] for i in marks.items] != ["第二条", "第一条"]:
+            problems.append("同是今天时应先按优先级: %r"
+                            % ([(i["text"], i.get("priority")) for i in marks.items],))
+        # 已完成的条目不参与「今天」置顶，但仍计入今天的进度
+        marks.toggle(m2["id"])
+        marks.resort(save=True)
+        if marks.items[-1]["text"] != "第二条":
+            problems.append("已完成的条目不该被「今天」顶到最前: %r"
+                            % ([i["text"] for i in marks.items],))
+        if marks.today_stats() != (1, 2):
+            problems.append("今天的进度统计不对: %r" % (marks.today_stats(),))
+        saved = Store(os.path.join(temp_dir, "marks.json"))
+        by_text = dict((i["text"], i) for i in saved.items)
+        if (saved.priority_of(by_text.get("第二条") or {}) != PRIORITY_HIGH
+                or not (by_text.get("第一条") or {}).get("today")):
+            problems.append("优先级/今天没有落盘: %r"
+                            % ([(i["text"], i.get("priority"), i.get("today"))
+                                for i in saved.items],))
+        if [i["text"] for i in saved.items] != [i["text"] for i in marks.items]:
+            problems.append("归位后的顺序没有落盘: %r" % ([i["text"] for i in saved.items],))
+
         # ---- 默认排序：未完成 → 等待中 → 已完成（同组内保持手动顺序）----
         order = Store(os.path.join(temp_dir, "order.json"))
         a = order.add("A")            # 顺序：A B C D（新增插到最前）
@@ -3008,7 +3231,7 @@ def run_check():
                 problems.append("标记等待中时行控件被重建了（双击会因此失效）")
             if target["done"]:
                 problems.append("等待中不该同时是已完成")
-            ring = (getattr(row_wait, "_wait_items", None) or (None,))[0]
+            ring = ((getattr(row_wait, "_markers", None) or {}).get("wait") or ((None,),))[0][0]
             if ring is None or str(row_wait.itemcget(ring, "outline")) != C_WAIT:
                 problems.append("等待中的那一行小钟没有变成琥珀色（说明没重画）")
             # 在钟上按下、移出去再松手 → 不该改状态
@@ -3023,6 +3246,59 @@ def run_check():
             if Store(path).state_of(
                     [i for i in Store(path).items if i["id"] == target["id"]][0]) != STATE_TODO:
                 problems.append("等待状态没有落盘")
+            # ---- 优先级旗子 / 今天按钮 ----
+            mark_item = broken.items[0]
+            prio_x = widget.list_w - widget.del_w - widget.wait_w - widget.today_w \
+                - widget.prio_w // 2
+            today_x = widget.list_w - widget.del_w - widget.wait_w - widget.today_w // 2
+            row_mark = widget._row_widget(mark_item["id"])
+            widget._row_press(_StubEvent(x=prio_x), mark_item["id"])
+            widget._row_release(_StubEvent(x=prio_x))
+            if widget.store.priority_of(mark_item) != PRIORITY_HIGH:
+                problems.append("点旗子没有把优先级设成高")
+            if widget._row_widget(mark_item["id"]) is not row_mark:
+                problems.append("改优先级时行控件被重建了（双击会因此失效）")
+            # 注意：_draw_row 里 delete("all") 之后图元 id 会变，每次都要重新取
+            flag = row_mark._markers["prio"][1][0]
+            if str(row_mark.itemcget(flag, "fill")) != C_HIGH:
+                problems.append("高优先级旗子应是实心橙: %r"
+                                % (row_mark.itemcget(flag, "fill"),))
+            widget._row_press(_StubEvent(x=prio_x), mark_item["id"])
+            widget._row_release(_StubEvent(x=prio_x))
+            if widget.store.priority_of(mark_item) != PRIORITY_MID:
+                problems.append("再点旗子应变成中优先级")
+            flag = row_mark._markers["prio"][1][0]
+            if str(row_mark.itemcget(flag, "fill")) not in ("", "none"):
+                problems.append("中优先级旗子应是空心: %r"
+                                % (row_mark.itemcget(flag, "fill"),))
+            if str(row_mark.itemcget(flag, "outline")) != C_HIGH:
+                problems.append("中优先级旗子边框应是橙色: %r"
+                                % (row_mark.itemcget(flag, "outline"),))
+            widget._row_press(_StubEvent(x=prio_x), mark_item["id"])
+            widget._row_release(_StubEvent(x=widget.text_x))
+            if widget.store.priority_of(mark_item) != PRIORITY_MID:
+                problems.append("在旗子上按下但移出后松手，不该改优先级")
+            widget._row_press(_StubEvent(x=today_x), mark_item["id"])
+            widget._row_release(_StubEvent(x=today_x))
+            if not mark_item.get("today"):
+                problems.append("点「今」没有标记今天")
+            today_text = row_mark._markers["today"][0][0]   # 同上：重画后重新取
+            if str(row_mark.itemcget(today_text, "fill")) != C_ACCENT:
+                problems.append("今天的「今」应是蓝色: %r"
+                                % (row_mark.itemcget(today_text, "fill"),))
+            if "今天" not in str(widget.hint.cget("text")):
+                problems.append("底部没有显示今天进度: %r" % (widget.hint.cget("text"),))
+            widget._row_press(_StubEvent(x=today_x), mark_item["id"])
+            widget._row_release(_StubEvent(x=today_x))
+            if mark_item.get("today"):
+                problems.append("再点「今」应取消今天标记")
+            probe = {"id": -1, "text": "x", "done": False, "state": STATE_TODO,
+                     "priority": PRIORITY_NONE, "today": False}
+            if widget._bucket_of(probe) == widget._bucket_of(dict(probe, priority=PRIORITY_HIGH)):
+                problems.append("优先级没有参与排序桶")
+            if widget._bucket_of(probe) == widget._bucket_of(dict(probe, today=True)):
+                problems.append("「今天」没有参与排序桶")
+
             # ---- 尺寸：默认排版不能变，拉大后要跟着重排 ----
             default_w = _scaled(PANEL_W, widget.s)
             default_h = _scaled(LIST_MAX_H, widget.s)
