@@ -132,7 +132,10 @@ Deepin 的托盘图标这条路**已确认走不通**（三条路都试到底，
 - 数据：条目加 `done_at`（勾成完成时记、取消时清）；`todos.json` 加 `archive` 段
   （`{item, archived_at, reason}`，reason ∈ `done` / `cleared` / `deleted`，最多 500 条）。
 - **过 00:00 自动归档**：`archive_completed()` 只收 `state==done` 且 `done_at < 今天 00:00` 的；
-  界面每分钟（`ARCHIVE_TICK_MS`）看一眼跨没跨天，**启动时先看一眼**（昨天关机也一样生效）。
+  **只在启动时看一眼**（`_archive_on_start()` → `_archive_tick()`，`_archived_day` 保证一天最多一次）。
+  2026-10-14 YanH 定：**不要周期性检查** —— 每分钟那次的成本其实近乎为零（一次 `localtime`+`mktime` 比较，
+  跨天才动数据），但行为上东西会在眼前 00:00 消失，不如「第二天打开时收」可预期，也少一个活动部件。
+  自检里有一条结构断言卡着：不许再出现 `_archive_job` / `_archive_timer_tick`。
 - **删除 = 进归档**：`pop()` 先 `_archive_item(..., "deleted")`，`restore()` 再 `_unarchive()` ——
   所以删除不可能丢数据，底部 8 秒的「撤销删除」只是顺手。
 - **「清除已完成」改名「归档已完成」**，行为也跟着从"真删"改成"归档"（`reason: cleared`）。
