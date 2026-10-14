@@ -83,6 +83,8 @@ DEL_W = 30             # 条目右侧删除按钮的点击区宽度
 ROW_PAD_Y = 6          # 条目上下内边距
 ROW_WRAP = LIST_W - TEXT_X - DEL_W - 4  # 条目文字换行宽度
 UNDO_SECONDS = 8       # 删除后「撤销」保留的秒数
+ARCHIVE_MAX = 500      # 归档最多留多少条（超了丢最老的）
+ARCHIVE_TICK_MS = 60000  # 每分钟看一眼有没有跨过 00:00（跨了就自动归档已完成的）
 DOUBLE_CLICK_REVERT_S = 0.8   # 双击进入编辑时，把第一次单击的勾选撤回的时间窗
 
 # 条目状态：未完成 / 等待中 / 已完成
@@ -1417,6 +1419,7 @@ class Store(object):
         self.ui = {"x": None, "y": None, "collapsed": False, "alpha": 0.94,
                    "topmost": False, "hotkey": HOTKEY_DEFAULT,
                    "width": None, "height": None}
+        self.archive = []                 # 归档：完成的（过 00:00）/ 清掉的 / 删掉的都进这里
         self._next_id = 1
         self.load()
 
@@ -1434,6 +1437,14 @@ class Store(object):
         if not isinstance(raw, dict):
             return
 
+        archived = raw.get("archive")
+        if isinstance(archived, list):
+            for record in archived:
+                if not isinstance(record, dict) or not isinstance(record.get("item"), dict):
+                    continue
+                self.archive.append({"item": record["item"],
+                                     "archived_at": record.get("archived_at") or time.time(),
+                                     "reason": record.get("reason") or "done"})
         entries = raw.get("items")
         if isinstance(entries, list):
             for index, entry in enumerate(entries):
@@ -1460,6 +1471,7 @@ class Store(object):
                     "id": item_id,
                     "text": text,
                     "steps": self._clean_steps(entry.get("steps")),
+                    "done_at": self._load_done_at(entry, state),
                     "done": state == STATE_DONE,
                     "state": state,
                     "priority": priority if priority in (PRIORITY_NONE, PRIORITY_MID,
@@ -1506,7 +1518,8 @@ class Store(object):
                 os.makedirs(directory)
             temp = self.path + ".tmp"
             with open(temp, "w", encoding="utf-8") as handle:
-                json.dump({"version": 1, "items": self.items, "ui": self.ui},
+                json.dump({"version": 1, "items": self.items,
+                           "archive": self.archive, "ui": self.ui},
                           handle, ensure_ascii=False, indent=2)
             os.replace(temp, self.path)
         except (IOError, OSError):
@@ -1520,7 +1533,7 @@ class Store(object):
             return None
         item = {"id": self._next_id, "text": text, "steps": [], "done": False,
                 "state": STATE_TODO, "priority": PRIORITY_NONE, "today": False,
-                "created": time.time()}
+                "done_at": None, "created": time.time()}
         self._next_id += 1
         self.items.insert(0, item)
         self.save()
@@ -1530,6 +1543,11 @@ class Store(object):
         """统一改状态：state 为准，done 跟着同步，然后落盘。"""
         item["state"] = state
         item["done"] = state == STATE_DONE
+        if state == STATE_DONE:
+            if not item.get("done_at"):
+                item["done_at"] = time.time()      # 记下"什么时候完成的"
+        else:
+            item["done_at"] = None                 # 又变回没完成了
         self.save()
         return item
 
@@ -1732,6 +1750,7 @@ class Store(object):
         for index, item in enumerate(self.items):
             if item["id"] == item_id:
                 self.items.pop(index)
+                self._archive_item(item, "deleted")   # 先归档，撤销=从归档里拿回来
                 self.save()
                 return {"item": item, "index": index}
         return None
@@ -1746,12 +1765,85 @@ class Store(object):
                 return False              # 已经在列表里，别插重复
         index = max(0, min(int(record.get("index", 0)), len(self.items)))
         self.items.insert(index, item)
+        self._unarchive(item["id"])
         self.save()
         return True
 
+    @staticmethod
+    def day_start(now=None):
+        """今天 00:00 的时间戳（本地时区）。"""
+        now = time.time() if now is None else now
+        parts = time.localtime(now)[:3]
+        # mktime 要 9 元组：(年,月,日,时,分,秒,周几,一年第几天,是否夏令时)
+        return time.mktime(tuple(parts) + (0, 0, 0, 0, 0, -1))
+
+    @staticmethod
+    def _load_done_at(entry, state):
+        """完成时间：老数据没这个字段就按"现在"算 —— 免得一升级就被自动归档掉。"""
+        if state != STATE_DONE:
+            return None
+        try:
+            value = float(entry.get("done_at") or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        return value if value > 0 else time.time()
+
+    def _archive_item(self, item, reason, now=None):
+        """把一条从活动列表挪进归档（不丢数据）。"""
+        self.archive.append({"item": item,
+                             "archived_at": time.time() if now is None else now,
+                             "reason": reason})
+        self._trim_archive()
+
+    def _trim_archive(self):
+        """归档只留最近 ARCHIVE_MAX 条（按归档时间）。"""
+        if len(self.archive) > ARCHIVE_MAX:
+            self.archive.sort(key=lambda record: record.get("archived_at") or 0)
+            self.archive = self.archive[-ARCHIVE_MAX:]
+
+    def _unarchive(self, item_id):
+        """把某条从归档里摘掉（撤销删除 / 恢复时用）。"""
+        before = len(self.archive)
+        self.archive = [record for record in self.archive
+                        if record.get("item", {}).get("id") != item_id]
+        return len(self.archive) != before
+
+    def archive_completed(self, now=None):
+        """把「今天 00:00 之前完成」的条目挪进归档；返回挪了几条。
+
+        今天完成的还留着（当天能看到），过了 00:00 再看就不显示了。
+        """
+        now = time.time() if now is None else now
+        boundary = self.day_start(now)
+        keep, moved = [], []
+        for item in self.items:
+            done_at = item.get("done_at")
+            if item.get("state") == STATE_DONE and done_at and done_at < boundary:
+                moved.append(item)
+            else:
+                keep.append(item)
+        if not moved:
+            return 0
+        for item in moved:
+            self._archive_item(item, "done", now)
+        self.items = keep
+        self.save()
+        return len(moved)
+
+    def archive_stats(self):
+        """归档条数（按原因分开数）。"""
+        counts = {"done": 0, "cleared": 0, "deleted": 0}
+        for record in self.archive:
+            counts[record.get("reason") or "done"] = \
+                counts.get(record.get("reason") or "done", 0) + 1
+        return len(self.archive), counts
+
     def clear_done(self):
         before = len(self.items)
+        moved = [item for item in self.items if item["done"]]
         self.items = [item for item in self.items if not item["done"]]
+        for item in moved:
+            self._archive_item(item, "cleared")      # 归档，不再真删
         if len(self.items) != before:
             self.save()
             return before - len(self.items)
@@ -1993,6 +2085,9 @@ class TodoWidget(object):
         self._build_list()
         self._build_footer()
         self.menu = self._build_menu()
+        self._archive_job = None
+        self._archived_day = None
+        self._start_archive_timer()
 
     def _build_header(self):
         self.header = head = tk.Frame(self.card, bg=C_CARD, height=self.header_h)
@@ -2065,12 +2160,12 @@ class TodoWidget(object):
         self.hint = tk.Label(foot, text="双击标题可折叠", bg=C_CARD, fg=C_MUTED, font=self.fonts["small"])
         self.hint.pack(side="left")
         # 「撤销」只在刚删掉一条时出现（见 _show_undo / _clear_undo），平时不占位置
-        self.undo_btn = tk.Label(foot, text="撤销", bg=C_CARD, fg=C_ACCENT,
+        self.undo_btn = tk.Label(foot, text="撤销删除", bg=C_CARD, fg=C_ACCENT,
                                  font=self.fonts["small"], cursor="hand2")
         self.undo_btn.bind("<Button-1>", lambda event: self.undo_delete())
         self.undo_btn.bind("<Enter>", lambda event: self.undo_btn.configure(fg=C_TEXT))
         self.undo_btn.bind("<Leave>", lambda event: self.undo_btn.configure(fg=C_ACCENT))
-        self.clear_btn = tk.Label(foot, text="清除已完成", bg=C_CARD, fg=C_DIM,
+        self.clear_btn = tk.Label(foot, text="归档已完成", bg=C_CARD, fg=C_DIM,
                                   font=self.fonts["small"], cursor="hand2")
         self.clear_btn.bind("<Button-1>", lambda event: self.clear_done())
         self.clear_btn.bind("<Enter>", lambda event: self.clear_btn.configure(fg=C_TEXT))
@@ -2673,6 +2768,27 @@ class TodoWidget(object):
             self.clear_btn.pack(side="right")
         else:
             self.clear_btn.pack_forget()
+
+    def _start_archive_timer(self):
+        """启动时先看一眼（可能昨天关机了），之后每分钟看一次有没有跨过 00:00。"""
+        self._archive_tick()
+        self._archive_job = self.root.after(ARCHIVE_TICK_MS, self._archive_timer_tick)
+
+    def _archive_timer_tick(self):
+        self._archive_tick()
+        self._archive_job = self.root.after(ARCHIVE_TICK_MS, self._archive_timer_tick)
+
+    def _archive_tick(self, now=None):
+        """跨天就把「今天 00:00 之前完成」的条目收进归档；返回收了几条。"""
+        now = time.time() if now is None else now
+        day = self.store.day_start(now)
+        if self._archived_day == day:
+            return 0
+        moved = self.store.archive_completed(now)
+        self._archived_day = day
+        if moved:
+            self._refresh(keep_scroll=False)
+        return moved
 
     def _update_hint(self):
         """底部提示：折叠时提示展开，条目够多时提示可拖动排序 / 双击可改。"""
@@ -3762,6 +3878,98 @@ def run_check():
                 problems.append("优先级没有参与排序桶")
             if widget._bucket_of(probe) == widget._bucket_of(dict(probe, today=True)):
                 problems.append("「今天」没有参与排序桶")
+
+            # ---- 归档：过 00:00 自动收走已完成的；删除进归档、可撤销 ----
+            arc_path = os.path.join(temp_dir, "archive.json")
+            arc = Store(arc_path)
+            midnight = Store.day_start()
+            old_done = arc.add("昨天就完成了的")
+            arc.toggle(old_done["id"])
+            old_done["done_at"] = midnight - 60           # 昨天 23:59 完成
+            today_done = arc.add("今天刚完成的")
+            arc.toggle(today_done["id"])
+            plain = arc.add("还没做的")
+            moved_count = arc.archive_completed()
+            if moved_count != 1:
+                problems.append("自动归档应当只收走昨天完成的那一条，实际 %r" % (moved_count,))
+            left_ids = [item["id"] for item in arc.items]
+            if old_done["id"] in left_ids or today_done["id"] not in left_ids \
+                    or plain["id"] not in left_ids:
+                problems.append("自动归档收错了: %r" % (left_ids,))
+            total, counts = arc.archive_stats()
+            if total != 1 or counts.get("done") != 1:
+                problems.append("归档统计不对: %r" % ((total, counts),))
+            reload_arc = Store(arc_path)
+            if len(reload_arc.archive) != 1 \
+                    or reload_arc.archive[0]["item"]["id"] != old_done["id"]:
+                problems.append("归档没有落盘")
+            if [item["id"] for item in reload_arc.items] != left_ids:
+                problems.append("归档后的活动列表没有落盘")
+            # 删除 → 进归档；撤销 → 从归档里拿回来
+            victim = arc.items[0]
+            record = arc.pop(victim["id"])
+            if record is None or arc.archive_stats()[0] != 2:
+                problems.append("删除没有把条目送进归档（数据会丢）")
+            if not arc.restore(record):
+                problems.append("撤销删除失败")
+            if arc.archive_stats()[0] != 1 or victim["id"] not in [i["id"] for i in arc.items]:
+                problems.append("撤销删除后归档里还留着那条")
+            # 「归档已完成」= 归档，不是真删
+            arc.clear_done()
+            total, counts = arc.archive_stats()
+            if counts.get("cleared") != 1:
+                problems.append("「归档已完成」没有按 cleared 记进归档: %r" % (counts,))
+            if any(item["state"] == STATE_DONE for item in arc.items):
+                problems.append("「归档已完成」没有把已完成的挪走")
+            for index in range(ARCHIVE_MAX + 20):
+                arc._archive_item({"id": 900000 + index, "text": "x", "done": True,
+                                   "state": STATE_DONE}, "done")
+            if len(arc.archive) != ARCHIVE_MAX:
+                problems.append("归档没有限制在 %d 条: %r" % (ARCHIVE_MAX, len(arc.archive)))
+            # done_at：勾选时记、取消时清；老数据读取时补
+            dat = Store(os.path.join(temp_dir, "done-at.json"))
+            dat_item = dat.add("看 done_at")
+            if dat_item.get("done_at") is not None:
+                problems.append("新条目的 done_at 应当是空的")
+            dat.toggle(dat_item["id"])
+            if not dat_item.get("done_at"):
+                problems.append("勾成已完成时没有记 done_at")
+            dat.toggle(dat_item["id"])
+            if dat_item.get("done_at") is not None:
+                problems.append("取消完成后没有清掉 done_at")
+            legacy_path = os.path.join(temp_dir, "legacy-done.json")
+            legacy = Store(legacy_path)
+            legacy.items.append({"id": 1, "text": "老数据已完成", "done": True,
+                                 "state": STATE_DONE, "priority": PRIORITY_NONE,
+                                 "today": False, "created": time.time()})
+            legacy.save()
+            if not Store(legacy_path).items[0].get("done_at"):
+                problems.append("老数据里已完成的条目读取时要补 done_at，否则一升级就被归档")
+            # 界面：定时器在跑；跨天那一眼真的把行收走；删除可撤销
+            if getattr(widget, "_archive_job", None) is None:
+                problems.append("没有挂归档定时器（跑到第二天不会自动收）")
+            widget.store.items.insert(0, {"id": 424242, "text": "昨天完成的界面条",
+                                          "steps": [], "done": True, "state": STATE_DONE,
+                                          "priority": PRIORITY_NONE, "today": False,
+                                          "done_at": Store.day_start() - 3600,
+                                          "created": time.time()})
+            widget._archived_day = None
+            moved_ui = widget._archive_tick()
+            if moved_ui != 1 or widget._row_widget(424242) is not None:
+                problems.append("跨天那一眼没有把已完成的行收走: %r" % (moved_ui,))
+            if not any(rec["item"]["id"] == 424242 for rec in widget.store.archive):
+                problems.append("界面归档的那条没有进 archive")
+            undo_victim = widget.store.items[0]
+            widget.remove_item(undo_victim["id"])
+            if widget._undo is None or "已删除" not in str(widget.hint.cget("text")):
+                problems.append("删掉之后没有出现撤销提示")
+            if str(widget.undo_btn.cget("text")) != "撤销删除":
+                problems.append("撤销按钮文案不对: %r" % (widget.undo_btn.cget("text"),))
+            widget.undo_delete()
+            if undo_victim["id"] not in [i["id"] for i in widget.store.items]:
+                problems.append("点撤销没有把删除的条目放回来")
+            if any(rec["item"]["id"] == undo_victim["id"] for rec in widget.store.archive):
+                problems.append("撤销之后归档里还留着那条")
 
             # ---- 尺寸：默认排版不能变，拉大后要跟着重排 ----
             default_w = _scaled(PANEL_W, widget.s)
