@@ -95,6 +95,9 @@ STATE_ORDER = (STATE_TODO, STATE_WAITING, STATE_DONE)
 WAIT_W = 30             # 条目右侧「等待」按钮的点击区宽度
 TODAY_W = 26            # 条目右侧「今天」按钮的点击区宽度
 PRIO_W = 26             # 条目右侧「优先级」按钮的点击区宽度
+STEP_MAX = 20           # 一条待办最多几个子步骤（防止数据被灌爆）
+STEP_BOX = 11           # 子步骤小方框边长
+STEP_INDENT = 20        # 子步骤文字相对条目文字的缩进
 
 # 优先级：0 无 / 1 中 / 2 高（值越大越靠前）；点一下按这个顺序循环
 PRIORITY_NONE, PRIORITY_MID, PRIORITY_HIGH = 0, 1, 2
@@ -1455,6 +1458,7 @@ class Store(object):
                 self.items.append({
                     "id": item_id,
                     "text": text,
+                    "steps": self._clean_steps(entry.get("steps")),
                     "done": state == STATE_DONE,
                     "state": state,
                     "priority": priority if priority in (PRIORITY_NONE, PRIORITY_MID,
@@ -1513,7 +1517,7 @@ class Store(object):
         text = " ".join(str(text).split())
         if not text:
             return None
-        item = {"id": self._next_id, "text": text, "done": False,
+        item = {"id": self._next_id, "text": text, "steps": [], "done": False,
                 "state": STATE_TODO, "priority": PRIORITY_NONE, "today": False,
                 "created": time.time()}
         self._next_id += 1
@@ -1544,6 +1548,60 @@ class Store(object):
                 state = item.get("state", STATE_DONE if item["done"] else STATE_TODO)
                 return self._set_state(
                     item, STATE_TODO if state == STATE_WAITING else STATE_WAITING)
+        return None
+
+    @staticmethod
+    def _clean_steps(raw):
+        """把任意输入收拾成 [{text, done}]：去空行、限条数、text 限长。"""
+        steps = []
+        if not isinstance(raw, list):
+            return steps
+        for entry in raw:
+            if isinstance(entry, dict):
+                text = " ".join(str(entry.get("text", "")).split())
+                done = bool(entry.get("done"))
+            elif isinstance(entry, str):
+                text = " ".join(entry.split())
+                done = False
+            else:
+                continue                      # None / 数字之类一律丢掉，别变成 "None"
+            if not text:
+                continue
+            steps.append({"text": text[:200], "done": done})
+            if len(steps) >= STEP_MAX:
+                break
+        return steps
+
+    def steps_of(self, item):
+        """取子步骤（兼容老数据/坏数据）：总是返回一份新的干净列表。"""
+        return self._clean_steps(item.get("steps"))
+
+    def steps_progress(self, item):
+        """(已完成数, 总数)。"""
+        steps = self.steps_of(item)
+        return len([step for step in steps if step["done"]]), len(steps)
+
+    def set_steps(self, item_id, steps):
+        """整体替换某条的子步骤（编辑器保存时用）。"""
+        cleaned = self._clean_steps(steps)
+        for item in self.items:
+            if item["id"] == item_id:
+                item["steps"] = cleaned
+                self.save()
+                return item
+        return None
+
+    def toggle_step(self, item_id, index):
+        """勾选第 index 个子步骤（不动主条目的状态）。"""
+        for item in self.items:
+            if item["id"] == item_id:
+                steps = self.steps_of(item)
+                if not isinstance(index, int) or not 0 <= index < len(steps):
+                    return None
+                steps[index]["done"] = not steps[index]["done"]
+                item["steps"] = steps
+                self.save()
+                return item
         return None
 
     def priority_of(self, item):
@@ -1725,6 +1783,8 @@ class TodoWidget(object):
         self.wait_w = _scaled(WAIT_W, scale)
         self.today_w = _scaled(TODAY_W, scale)
         self.prio_w = _scaled(PRIO_W, scale)
+        self.step_box = _scaled(STEP_BOX, scale)
+        self.step_indent = _scaled(STEP_INDENT, scale)
         # 右侧按钮：从右往左排（区名, 宽度）。绘制、点击判定、折行宽度共用这一张表
         self.markers = (("delete", self.del_w), ("wait", self.wait_w),
                         ("today", self.today_w), ("prio", self.prio_w))
@@ -1825,6 +1885,7 @@ class TodoWidget(object):
         self._undo_job = None             # 撤销时限的 after 句柄
         self._edit_id = None              # 正在编辑的条目 id
         self._edit_entry = None           # 正在编辑的输入框（盖在那一行上）
+        self._steps_edit = None           # 正在编辑子步骤的 (多行框, 条目 id)
         self._last_toggle = (None, 0.0)   # 最近一次勾选（条目 id, 时间），供双击回退
         self._regroup_job = None          # 归位（按状态分组排序）的待执行任务
         self._build()
@@ -1891,6 +1952,7 @@ class TodoWidget(object):
             "small": tkfont.Font(family=actual, size=9),
             "done": tkfont.Font(family=actual, size=10, overstrike=1),
             "marker": tkfont.Font(family=actual, size=8),
+            "small_done": tkfont.Font(family=actual, size=9, overstrike=1),
         }
 
     # ---- 组装 ----
@@ -2121,6 +2183,7 @@ class TodoWidget(object):
         # 行会被重建，正在编辑的输入框随之销毁，别留悬空引用
         self._edit_id = None
         self._edit_entry = None
+        self._steps_edit = None
         self.row_widgets = []
         self._press = None
         self._drag_id = None
@@ -2178,16 +2241,42 @@ class TodoWidget(object):
         canvas._today = bool(item.get("today"))
         font = self.fonts["done"] if done else self.fonts["base"]
         line_h = font.metrics("linespace")
-        lines = self._wrap_text(item["text"], font, self.row_wrap)
-        row_h = line_h * len(lines) + 2 * self.row_pad_y
+        steps = self.store.steps_of(item)
+        done_steps, total_steps = self.store.steps_progress(item)
+        count_text = ("%d/%d" % (done_steps, total_steps)) if total_steps else ""
+        count_font = self.fonts["marker"]
+        count_w = (count_font.measure(count_text) + self.px(6)) if count_text else 0
+        # 进度挂在正文最后一行的右边，所以正文的换行宽度要让出它的位置
+        main_wrap = max(self.px(40), self.row_wrap - count_w)
+        lines = self._wrap_text(item["text"], font, main_wrap)
+        step_h = self.fonts["small"].metrics("linespace") + self.px(2)
+        step_wrap = max(self.px(40), self.row_wrap - self.step_indent)
+        step_rows = 0
+        for step in steps:
+            step_font = self.fonts["small_done"] if step["done"] else self.fonts["small"]
+            step_rows += len(self._wrap_text(step["text"], step_font, step_wrap))
+        main_h = line_h * len(lines)
+        row_h = main_h + step_h * step_rows + 2 * self.row_pad_y
         if int(canvas.cget("height")) != row_h:
             canvas.configure(height=row_h)
 
-        self._draw_check(canvas, done, top=(row_h - self.check_box) // 2)
+        # 主勾选框对齐「主文字块」而不是整行：有子步骤时不会跑到中间去
+        self._draw_check(canvas, done,
+                         top=self.row_pad_y + (main_h - self.check_box) // 2)
         text_color = C_DONE if done else (C_WAIT if canvas._waiting else C_TEXT)
         for index, line in enumerate(lines):
             canvas.create_text(self.text_x, self.row_pad_y + index * line_h, text=line,
                                anchor="nw", fill=text_color, font=font)
+        canvas._steps_count_item = None
+        if count_text and lines:
+            count_x = self.text_x + font.measure(lines[-1]) + self.px(6)
+            canvas._steps_count_item = canvas.create_text(
+                count_x, self.row_pad_y + (len(lines) - 1) * line_h + line_h / 2.0,
+                text=count_text, anchor="w",
+                fill=C_ACCENT if done_steps >= total_steps else C_DIM,
+                font=count_font, tags="step")
+        canvas._step_boxes = self._draw_steps(canvas, steps, self.row_pad_y + main_h, step_h)
+        canvas._steps_done, canvas._steps_total = done_steps, total_steps
         canvas._markers = {
             "prio": self._draw_prio_marker(canvas, row_h),
             "today": self._draw_today_marker(canvas, row_h),
@@ -2197,6 +2286,50 @@ class TodoWidget(object):
         canvas._delete_item = canvas._markers["delete"][0][0]   # 兼容旧引用
         self._paint_markers(canvas, None)
         return canvas._delete_item, row_h
+
+    def _draw_steps(self, canvas, steps, top, step_h):
+        """在主文字下面逐行画子步骤，返回每行小方框的命中区。
+
+        返回 [(index, y0, y1, x0, x1)]（canvas 坐标）。点小方框 = 勾这个步骤；
+        点这一行的其它地方什么也不做 —— 免得误把整条待办标成完成。
+        """
+        boxes = []
+        step_font = self.fonts["small"]
+        step_wrap = max(self.px(40), self.row_wrap - self.step_indent)
+        step_h = step_h * 1.0
+        y = top
+        for index, step in enumerate(steps):
+            font = self.fonts["small_done"] if step["done"] else step_font
+            text_lines = self._wrap_text(step["text"], font, step_wrap)
+            block_h = step_h * len(text_lines)
+            y0 = y
+            cy = y0 + step_h / 2.0
+            box = self.step_box
+            left = self.text_x
+            bx0, by0 = left, cy - box / 2.0
+            bx1, by1 = left + box, cy + box / 2.0
+            if step["done"]:
+                canvas.create_rectangle(bx0, by0, bx1, by1, fill=C_ACCENT, outline="",
+                                        tags="step")
+                canvas.create_line(bx0 + box * 0.22, by0 + box * 0.52,
+                                   bx0 + box * 0.44, by0 + box * 0.74,
+                                   bx0 + box * 0.80, by0 + box * 0.26,
+                                   fill="#ffffff", width=max(1.0, 1.6 * self.s),
+                                   capstyle="round", joinstyle="round", tags="step")
+            else:
+                canvas.create_rectangle(bx0, by0, bx1, by1, outline=C_BORDER,
+                                        width=max(1.0, 1.2 * self.s), tags="step")
+            for line_index, line in enumerate(text_lines):
+                canvas.create_text(self.text_x + self.step_indent,
+                                   y0 + line_index * step_h,
+                                   text=line, anchor="nw",
+                                   fill=C_DONE if step["done"] else C_DIM,
+                                   font=font, tags="step")
+            boxes.append((index, y0, y0 + block_h,
+                          bx0 - self.px(3), bx1 + self.px(4)))
+            y += block_h
+        canvas._step_top = top
+        return boxes
 
     # ---- 右侧按钮：位置、绘制、上色 ----
     def _marker_center(self, zone, row_h):
@@ -2324,6 +2457,8 @@ class TodoWidget(object):
             return False
         if self._edit_entry is not None and self._edit_id == item_id:
             return False                     # 正在编辑这一行，别把它盖掉
+        if self._steps_edit is not None and self._steps_edit[1] == item_id:
+            return False                     # 正在编辑子步骤，同理
         before = int(widget.cget("height"))
         self._draw_row(widget, item)
         if int(widget.cget("height")) != before:
@@ -2349,6 +2484,7 @@ class TodoWidget(object):
         row.bind("<B1-Motion>", self._row_motion)
         row.bind("<ButtonRelease-1>", self._row_release)
         row.bind("<Double-Button-1>", lambda event, i=item_id: self._begin_edit(i, event))
+        row.bind("<Button-3>", lambda event, i=item_id: self._popup_row_menu(event, i))
         row.bind("<Motion>", on_motion)
         row.bind("<Leave>", on_leave)
         self._bind_wheel(row)
@@ -2357,9 +2493,19 @@ class TodoWidget(object):
 
     # ---- 条目拖拽排序 ----
     def _row_press(self, event, item_id):
-        """记住按下的位置：右侧四个按钮各自成区，其余当"点条目本身"（勾选/拖拽）。"""
-        self._press = {"id": item_id, "y": event.y_root,
-                       "zone": self._zone_at(event.x) or "body"}
+        """记住按下的位置：右侧按钮各自成区，子步骤小方框单独成区，其余当"点条目本身"。"""
+        zone, step = self._zone_at(event.x), None
+        event_y = getattr(event, "y", 0)
+        widget = self._row_widget(item_id)
+        if zone is None and widget is not None:
+            for index, y0, y1, x0, x1 in getattr(widget, "_step_boxes", None) or []:
+                if x0 <= event.x <= x1 and y0 <= event_y <= y1:
+                    zone, step = "step", index
+                    break
+            if zone is None and event_y >= getattr(widget, "_step_top", 1e9):
+                zone = "step-area"        # 子步骤那一行（但不是小方框）：什么也不做
+        self._press = {"id": item_id, "y": event.y_root, "zone": zone or "body",
+                       "step": step}
 
     def _row_motion(self, event):
         if self._press is None:
@@ -2381,6 +2527,18 @@ class TodoWidget(object):
         if press is None:
             return
         zone = press["zone"]
+        if zone == "step-area":
+            return                       # 点的是子步骤那一行的空白处：什么也不做
+        if zone == "step":
+            widget = self._row_widget(press["id"])
+            hit = None
+            for index, y0, y1, x0, x1 in getattr(widget, "_step_boxes", None) or []:
+                if x0 <= event.x <= x1 and y0 <= getattr(event, "y", 0) <= y1:
+                    hit = index
+                    break
+            if hit is not None and hit == press.get("step"):
+                self.toggle_step_item(press["id"], hit)
+            return
         if zone == "body":
             self.toggle_item(press["id"])
             return
@@ -2706,6 +2864,16 @@ class TodoWidget(object):
         self._update_footer()
         return item
 
+    def toggle_step_item(self, item_id, index):
+        """勾选一个子步骤：只重画那一行；不动主条目的状态，也不参与排序。"""
+        item = self.store.toggle_step(item_id, index)
+        if item is None:
+            return None
+        if not self._redraw_row(item_id):
+            self._refresh()
+        self._update_footer()
+        return item
+
     def cycle_priority_item(self, item_id):
         """点旗子：无 → 高 → 中 → 无。排序会变，所以照例延迟归位。"""
         item = self.store.cycle_priority(item_id)
@@ -2797,7 +2965,13 @@ class TodoWidget(object):
         """双击条目：在那一行上盖一个输入框；回车保存、Esc 取消、点到别处也算保存。"""
         if event is not None and event.x >= self._marker_zone_start():
             return                         # 双击落在右侧按钮上，不当编辑
+        if event is not None:
+            widget_now = self._row_widget(item_id)
+            if widget_now is not None and getattr(event, "y", 0) >= \
+                    getattr(widget_now, "_step_top", 1e9):
+                return                     # 双击在子步骤那一行上：也不当改主文字
         self._cancel_regroup()             # 编辑期间不归位：_refresh() 会把输入框一起销毁
+        self._end_steps_edit(save=True)    # 子步骤编辑器也先收掉
         if self._edit_entry is not None:
             self._end_edit(save=True)      # 先收掉上一个
         # 双击的第一下已经按「单击 = 勾选」处理过了；双击的语义是改文字，
@@ -2852,6 +3026,90 @@ class TodoWidget(object):
         changed = self.store.rename(item_id, text) if save else False
         self._refresh()
         self._schedule_regroup()             # 编辑结束再归位（编辑中归位会把输入框销毁）
+        return changed
+
+    def _popup_row_menu(self, event, item_id):
+        """右键条目：目前只有「编辑子步骤」，以后要加别的行内动作也放这儿。"""
+        item = self._find_item(item_id)
+        if item is None:
+            return
+        done, total = self.store.steps_progress(item)
+        label = "编辑子步骤…" if not total else "编辑子步骤（%d/%d 已完成）…" % (done, total)
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=label, command=lambda: self._begin_steps_edit(item_id))
+        if total:
+            menu.add_command(label="清空子步骤",
+                             command=lambda: self._clear_steps(item_id))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _clear_steps(self, item_id):
+        if self.store.set_steps(item_id, []) is not None:
+            if not self._redraw_row(item_id):
+                self._refresh()
+
+    # ---- 子步骤编辑（右键条目 → 编辑子步骤…）----
+    def _begin_steps_edit(self, item_id):
+        """在那一行上盖一个多行输入框，每行一个子步骤。
+
+        回车是换行，所以保存用 **Ctrl+回车** 或点到别处，Esc 取消。
+        完成标记按行位置保留：只改文字不删行的话，勾选状态不会丢。
+        """
+        self._cancel_regroup()
+        self._end_steps_edit(save=True)
+        if self._edit_entry is not None:
+            self._end_edit(save=True)
+        widget = self._row_widget(item_id)
+        item = self._find_item(item_id)
+        if widget is None or item is None:
+            return None
+        box = tk.Text(widget, bg=C_BORDER, fg=C_TEXT, insertbackground=C_TEXT,
+                      relief="flat", bd=0, highlightthickness=0,
+                      font=self.fonts["base"], wrap="none")
+        for step in self.store.steps_of(item):
+            box.insert("end", step["text"] + "\n")
+        height = int(widget.cget("height"))
+        box.place(x=self.text_x - self.px(2), y=self.px(2),
+                  width=max(self.px(60), self._marker_zone_start() - self.text_x),
+                  height=max(self.px(20), height - 2 * self.px(2)))
+        box.bind("<Escape>", lambda event: self._end_steps_edit(save=False))
+        box.bind("<Control-Return>", lambda event: self._end_steps_edit(save=True))
+        box.bind("<FocusOut>", lambda event: self._end_steps_edit(save=True))
+        self._steps_edit = (box, item_id)
+        try:
+            box.focus_force()
+            box.mark_set("insert", "end-1c")
+        except tk.TclError:
+            pass
+        return box
+
+    def _end_steps_edit(self, save=True):
+        """收掉子步骤编辑器：save=False 直接丢弃；save=True 按行写回（保留原勾选）。"""
+        record, self._steps_edit = self._steps_edit, None
+        if record is None:
+            return False
+        box, item_id = record
+        try:
+            raw = box.get("1.0", "end")
+        except tk.TclError:
+            return False
+        try:
+            box.destroy()
+        except tk.TclError:
+            pass
+        changed = False
+        if save:
+            before = self.store.steps_of(self._find_item(item_id) or {})
+            lines = [" ".join(line.split()) for line in raw.splitlines()]
+            steps = []
+            for index, line in enumerate(line for line in lines if line):
+                done = before[index]["done"] if index < len(before) else False
+                steps.append({"text": line, "done": done})
+            changed = self.store.set_steps(item_id, steps) is not None
+        self._refresh()
+        self._schedule_regroup()
         return changed
 
     def clear_done(self):
@@ -2996,6 +3254,50 @@ def run_check():
                             % (format_hotkey("super+t"), format_hotkey("ctrl+alt+k")))
         if parse_hotkey("Super+T") != parse_hotkey("super-t"):
             problems.append("快捷键对大小写和连字符应当等价")
+
+        # ---- 子步骤 ----
+        subs = Store(os.path.join(temp_dir, "steps.json"))
+        st1 = subs.add("带子步骤的一条")
+        if subs.steps_of(st1) != [] or subs.steps_progress(st1) != (0, 0):
+            problems.append("新条目应当没有子步骤")
+        subs.set_steps(st1["id"], ["第一", "", "  第二  ",
+                                   {"text": "第三", "done": True}])
+        got_steps = subs.steps_of(st1)
+        if [x["text"] for x in got_steps] != ["第一", "第二", "第三"] \
+                or [x["done"] for x in got_steps] != [False, False, True]:
+            problems.append("set_steps 没把数据收拾干净: %r" % (got_steps,))
+        if subs.steps_progress(st1) != (1, 3):
+            problems.append("子步骤进度统计不对: %r" % (subs.steps_progress(st1),))
+        subs.toggle_step(st1["id"], 0)
+        if subs.steps_of(st1)[0]["done"] is not True or subs.steps_progress(st1) != (2, 3):
+            problems.append("toggle_step 没生效: %r" % (subs.steps_of(st1),))
+        if subs.toggle_step(st1["id"], 99) is not None or subs.toggle_step(999999, 0) is not None:
+            problems.append("越界的子步骤索引应当返回 None")
+        subs.set_steps(st1["id"], ["步骤%02d" % i for i in range(STEP_MAX + 5)])
+        if len(subs.steps_of(st1)) != STEP_MAX:
+            problems.append("子步骤条数没有被限制在 %d: %r"
+                            % (STEP_MAX, len(subs.steps_of(st1))))
+        # 子步骤既不改主条目状态，也不参与排序
+        state_before = subs.state_of(st1)
+        order_before = [item["id"] for item in subs.items]
+        subs.toggle_step(st1["id"], 0)
+        subs.resort(save=True)
+        if subs.state_of(st1) != state_before or st1["done"]:
+            problems.append("勾选子步骤不该改动主条目的状态")
+        if [item["id"] for item in subs.items] != order_before:
+            problems.append("子步骤不该影响排序: %r → %r"
+                            % (order_before, [item["id"] for item in subs.items]))
+        reloaded_subs = Store(os.path.join(temp_dir, "steps.json"))
+        if reloaded_subs.steps_of(reloaded_subs.items[0])[0]["done"] is not True:
+            problems.append("子步骤的勾选没有落盘")
+        bad_steps = Store(os.path.join(temp_dir, "steps-bad.json"))
+        bad_item = bad_steps.add("坏数据")
+        bad_item["steps"] = "不是列表"
+        if bad_steps.steps_of(bad_item) != []:
+            problems.append("steps 不是列表时应当按空处理")
+        bad_item["steps"] = [None, 12, {"text": "  "}, {"text": "好", "done": 1}]
+        if [x["text"] for x in bad_steps.steps_of(bad_item)] != ["好"]:
+            problems.append("混杂的 steps 数据没有被清理: %r" % (bad_steps.steps_of(bad_item),))
 
         # ---- 优先级 / 「今天要办的」----
         marks = Store(os.path.join(temp_dir, "marks.json"))
@@ -3187,9 +3489,10 @@ def run_check():
             # 双击手势：第一下按「单击＝勾选」处理，进编辑时要把那一下撤回来，
             # 且必须真的进入编辑状态（隐藏窗口下用桩事件走 _row_press/_row_release）
             class _StubEvent(object):
-                def __init__(self, x, y_root=0):
+                def __init__(self, x, y_root=0, y=0):
                     self.x = x
                     self.y_root = y_root
+                    self.y = y
 
             done_before = target["done"]
             body_x = widget.text_x
@@ -3246,6 +3549,106 @@ def run_check():
             if Store(path).state_of(
                     [i for i in Store(path).items if i["id"] == target["id"]][0]) != STATE_TODO:
                 problems.append("等待状态没有落盘")
+            # ---- 子步骤：渲染 + 小方框勾选 + 步骤行保护 + 右键编辑器 ----
+            # 正文用一条"正好顶满行宽"的长文本：这样"进度小字有没有预留宽度"才验得出来
+            base_char = widget.fonts["base"].measure("长") or 1
+            long_text = "长" * max(4, int(widget.row_wrap // base_char))
+            step_item = widget.store.add(long_text)
+            widget.store.set_steps(step_item["id"], ["步骤甲", "步骤乙", "步骤丙"])
+            widget._refresh()
+            row_steps = widget._row_widget(step_item["id"])
+            boxes = getattr(row_steps, "_step_boxes", None) or []
+            if len(boxes) != 3:
+                problems.append("子步骤没画出三行小方框: %r" % (boxes,))
+            else:
+                box_h_before = int(row_steps.cget("height"))
+                count_id = getattr(row_steps, "_steps_count_item", None)
+                if count_id is None or str(row_steps.itemcget(count_id, "text")) != "0/3":
+                    problems.append("子步骤进度没有内联显示成 0/3")
+                elif row_steps.bbox(count_id)[2] > widget._marker_zone_start():
+                    problems.append("行尾的进度小字压到了右侧图标区")
+                index, y0, y1, x0, x1 = boxes[1]          # 勾第二个
+                cx = (x0 + x1) // 2
+                cy = (y0 + y1) // 2
+                widget._row_press(_StubEvent(x=cx, y=cy), step_item["id"])
+                widget._row_release(_StubEvent(x=cx, y=cy))
+                steps_now = widget.store.steps_of(step_item)
+                if [s["done"] for s in steps_now] != [False, True, False]:
+                    problems.append("点小方框没有勾上第二个子步骤: %r" % (steps_now,))
+                if widget._row_widget(step_item["id"]) is not row_steps:
+                    problems.append("勾子步骤时行控件被重建了（双击会因此失效）")
+                if widget.store.state_of(step_item) == STATE_DONE:
+                    problems.append("勾子步骤不该把主条目标成已完成")
+                if int(row_steps.cget("height")) != box_h_before:
+                    problems.append("勾子步骤不该改变行高")
+                count_id = getattr(row_steps, "_steps_count_item", None)
+                if count_id is None or str(row_steps.itemcget(count_id, "text")) != "1/3":
+                    problems.append("勾完一个后行尾进度应是 1/3")
+                # 点步骤文字（不是小方框）什么也不该发生
+                step_text_x = widget.text_x + widget.step_indent + 12
+                widget._row_press(_StubEvent(x=step_text_x, y=cy), step_item["id"])
+                widget._row_release(_StubEvent(x=step_text_x, y=cy))
+                if [s["done"] for s in widget.store.steps_of(step_item)] != [False, True, False]:
+                    problems.append("点子步骤文字不该改动勾选")
+                if widget.store.state_of(step_item) == STATE_DONE:
+                    problems.append("点子步骤文字不该把主条目标成已完成")
+                # 双击落在子步骤那一行 → 不该进主文字编辑
+                widget._begin_edit(step_item["id"], _StubEvent(x=step_text_x, y=cy))
+                if widget._edit_entry is not None:
+                    problems.append("双击子步骤那一行不该打开主文字编辑框")
+                # 右键条目的绑定必须在（子步骤编辑器的入口）
+                if not row_steps.bind("<Button-3>"):
+                    problems.append("条目没有绑定右键菜单，子步骤编辑器就没有入口")
+            # 编辑器：内容、保存（按行保留勾选）、Esc 取消
+            widget._begin_steps_edit(step_item["id"])
+            record = widget._steps_edit
+            if not record or record[0] is None:
+                problems.append("没有打开子步骤编辑器")
+            else:
+                box, _ = record
+                text_now = box.get("1.0", "end").strip()
+                if text_now != "步骤甲\n步骤乙\n步骤丙":
+                    problems.append("编辑器内容不对: %r" % (text_now,))
+                if widget._redraw_row(step_item["id"]):
+                    problems.append("子步骤编辑器开着时不该重画那一行")
+                box.delete("1.0", "end")
+                box.insert("end", "步骤甲改了\n步骤丙\n新加的第四步\n")
+                widget._end_steps_edit(save=True)
+                steps_saved = widget.store.steps_of(step_item)
+                if [s["text"] for s in steps_saved] != ["步骤甲改了", "步骤丙", "新加的第四步"]:
+                    problems.append("子步骤编辑器保存的文本不对: %r" % (steps_saved,))
+                if [s["done"] for s in steps_saved] != [False, True, False]:
+                    problems.append("按行位置保留勾选这条不对: %r" % (steps_saved,))
+                if widget._steps_edit is not None:
+                    problems.append("保存后编辑器引用没清掉")
+            widget._begin_steps_edit(step_item["id"])
+            box = (widget._steps_edit or (None, None))[0]
+            if box is not None:
+                box.delete("1.0", "end")
+                box.insert("end", "不该被保存\n")
+                widget._end_steps_edit(save=False)
+                if [s["text"] for s in widget.store.steps_of(step_item)] != \
+                        ["步骤甲改了", "步骤丙", "新加的第四步"]:
+                    problems.append("Esc 取消不该改动子步骤")
+            else:
+                problems.append("第二次打开子步骤编辑器失败")
+            # 全勾上（显式设成完成，别用 toggle —— 有的本来就是勾着的）：进度变强调色
+            widget.store.set_steps(step_item["id"],
+                                   [{"text": st["text"], "done": True}
+                                    for st in widget.store.steps_of(step_item)])
+            widget._refresh()
+            row_all = widget._row_widget(step_item["id"])
+            count_id = getattr(row_all, "_steps_count_item", None)
+            if count_id is None or str(row_all.itemcget(count_id, "fill")) != C_ACCENT:
+                problems.append("子步骤全完成时行尾进度应是强调色（id=%r text=%r fill=%r 进度=%r）"
+                                % (count_id,
+                                   row_all.itemcget(count_id, "text") if count_id else None,
+                                   row_all.itemcget(count_id, "fill") if count_id else None,
+                                   widget.store.steps_progress(step_item)))
+            # 收尾：删掉这条测试条目，后面用例面对的还是原来的列表
+            widget.store.pop(step_item["id"])
+            widget._refresh()
+
             # ---- 优先级旗子 / 今天按钮 ----
             mark_item = broken.items[0]
             prio_x = widget.list_w - widget.del_w - widget.wait_w - widget.today_w \
