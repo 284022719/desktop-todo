@@ -84,7 +84,6 @@ ROW_PAD_Y = 6          # 条目上下内边距
 ROW_WRAP = LIST_W - TEXT_X - DEL_W - 4  # 条目文字换行宽度
 UNDO_SECONDS = 8       # 删除后「撤销」保留的秒数
 ARCHIVE_MAX = 500      # 归档最多留多少条（超了丢最老的）
-ARCHIVE_TICK_MS = 60000  # 每分钟看一眼有没有跨过 00:00（跨了就自动归档已完成的）
 DOUBLE_CLICK_REVERT_S = 0.8   # 双击进入编辑时，把第一次单击的勾选撤回的时间窗
 
 # 条目状态：未完成 / 等待中 / 已完成
@@ -2085,9 +2084,8 @@ class TodoWidget(object):
         self._build_list()
         self._build_footer()
         self.menu = self._build_menu()
-        self._archive_job = None
         self._archived_day = None
-        self._start_archive_timer()
+        self._archive_on_start()
 
     def _build_header(self):
         self.header = head = tk.Frame(self.card, bg=C_CARD, height=self.header_h)
@@ -2769,17 +2767,16 @@ class TodoWidget(object):
         else:
             self.clear_btn.pack_forget()
 
-    def _start_archive_timer(self):
-        """启动时先看一眼（可能昨天关机了），之后每分钟看一次有没有跨过 00:00。"""
-        self._archive_tick()
-        self._archive_job = self.root.after(ARCHIVE_TICK_MS, self._archive_timer_tick)
+    def _archive_on_start(self):
+        """启动时看一眼：有没有「今天 00:00 之前完成」的，有就收进归档。
 
-    def _archive_timer_tick(self):
+        刻意**不做**周期性检查 —— 免得东西在你眼前 00:00 那一下消失；
+        只在打开它的时候收（一天最多一次，`_archived_day` 记着今天已经看过了）。
+        """
         self._archive_tick()
-        self._archive_job = self.root.after(ARCHIVE_TICK_MS, self._archive_timer_tick)
 
     def _archive_tick(self, now=None):
-        """跨天就把「今天 00:00 之前完成」的条目收进归档；返回收了几条。"""
+        """跨天就把「今天 00:00 之前完成」的条目收进归档；返回收了几条（同一天再叫返回 0）。"""
         now = time.time() if now is None else now
         day = self.store.day_start(now)
         if self._archived_day == day:
@@ -3946,8 +3943,10 @@ def run_check():
             if not Store(legacy_path).items[0].get("done_at"):
                 problems.append("老数据里已完成的条目读取时要补 done_at，否则一升级就被归档")
             # 界面：定时器在跑；跨天那一眼真的把行收走；删除可撤销
-            if getattr(widget, "_archive_job", None) is None:
-                problems.append("没有挂归档定时器（跑到第二天不会自动收）")
+            if hasattr(widget, "_archive_job") or hasattr(widget, "_archive_timer_tick"):
+                problems.append("不该再有周期性的归档定时器（只在启动时看一次）")
+            if widget._archive_tick() != 0:
+                problems.append("同一天里再叫一次归档应当什么都不做（一天最多一次）")
             widget.store.items.insert(0, {"id": 424242, "text": "昨天完成的界面条",
                                           "steps": [], "done": True, "state": STATE_DONE,
                                           "priority": PRIORITY_NONE, "today": False,
