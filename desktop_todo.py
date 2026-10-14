@@ -95,6 +95,7 @@ STATE_ORDER = (STATE_TODO, STATE_WAITING, STATE_DONE)
 WAIT_W = 30             # 条目右侧「等待」按钮的点击区宽度
 TODAY_W = 26            # 条目右侧「今天」按钮的点击区宽度
 PRIO_W = 26             # 条目右侧「优先级」按钮的点击区宽度
+STEPS_W = 30            # 条目右侧「子步骤」按钮的点击区宽度
 STEP_MAX = 20           # 一条待办最多几个子步骤（防止数据被灌爆）
 STEP_BOX = 11           # 子步骤小方框边长
 STEP_INDENT = 20        # 子步骤文字相对条目文字的缩进
@@ -1610,6 +1611,17 @@ class Store(object):
         return value if value in (PRIORITY_NONE, PRIORITY_MID, PRIORITY_HIGH) \
             else PRIORITY_NONE
 
+    def set_priority(self, item_id, value):
+        """直接设优先级（右键菜单用；cycle_priority 保留给自检与将来用）。"""
+        if value not in (PRIORITY_NONE, PRIORITY_MID, PRIORITY_HIGH):
+            return None
+        for item in self.items:
+            if item["id"] == item_id:
+                item["priority"] = value
+                self.save()
+                return item
+        return None
+
     def cycle_priority(self, item_id):
         """点旗子：无 → 高 → 中 → 无。"""
         for item in self.items:
@@ -1783,11 +1795,12 @@ class TodoWidget(object):
         self.wait_w = _scaled(WAIT_W, scale)
         self.today_w = _scaled(TODAY_W, scale)
         self.prio_w = _scaled(PRIO_W, scale)
+        self.steps_w = _scaled(STEPS_W, scale)
         self.step_box = _scaled(STEP_BOX, scale)
         self.step_indent = _scaled(STEP_INDENT, scale)
         # 右侧按钮：从右往左排（区名, 宽度）。绘制、点击判定、折行宽度共用这一张表
-        self.markers = (("delete", self.del_w), ("wait", self.wait_w),
-                        ("today", self.today_w), ("prio", self.prio_w))
+        # 右侧只留两个：子步骤（≡ / 2-3）与删除。等待中/今天/优先级搬进右键菜单
+        self.markers = (("delete", self.del_w), ("steps", self.steps_w))
         self.marker_w = sum(width for _, width in self.markers)
         self.row_pad_y = _scaled(ROW_PAD_Y, scale)
         self.row_wrap = max(_scaled(40, scale),
@@ -2243,12 +2256,7 @@ class TodoWidget(object):
         line_h = font.metrics("linespace")
         steps = self.store.steps_of(item)
         done_steps, total_steps = self.store.steps_progress(item)
-        count_text = ("%d/%d" % (done_steps, total_steps)) if total_steps else ""
-        count_font = self.fonts["marker"]
-        count_w = (count_font.measure(count_text) + self.px(6)) if count_text else 0
-        # 进度挂在正文最后一行的右边，所以正文的换行宽度要让出它的位置
-        main_wrap = max(self.px(40), self.row_wrap - count_w)
-        lines = self._wrap_text(item["text"], font, main_wrap)
+        lines = self._wrap_text(item["text"], font, self.row_wrap)
         step_h = self.fonts["small"].metrics("linespace") + self.px(2)
         step_wrap = max(self.px(40), self.row_wrap - self.step_indent)
         step_rows = 0
@@ -2260,28 +2268,34 @@ class TodoWidget(object):
         if int(canvas.cget("height")) != row_h:
             canvas.configure(height=row_h)
 
+        # 优先级：行最左边一条竖条（高＝整条、中＝中间半条）。不占正文宽度
+        if canvas._prio in (PRIORITY_HIGH, PRIORITY_MID):
+            bar_w = max(2.0, self.px(3))
+            if canvas._prio == PRIORITY_HIGH:
+                bar_top, bar_bottom = 0.0, float(row_h)
+            else:
+                bar_top, bar_bottom = row_h * 0.25, row_h * 0.75
+            canvas.create_rectangle(0, bar_top, bar_w, bar_bottom, fill=C_HIGH,
+                                    outline="", tags="prio")
+        # 今天：正文前面的小蓝点（在勾选框与文字之间的空档里，也不占宽度）
+        if canvas._today:
+            dot = max(2.0, self.px(3))
+            dot_x, dot_y = self.text_x - self.px(8), self.row_pad_y + line_h / 2.0
+            canvas.create_oval(dot_x - dot, dot_y - dot, dot_x + dot, dot_y + dot,
+                               fill=C_ACCENT, outline="", tags="today")
+
         # 主勾选框对齐「主文字块」而不是整行：有子步骤时不会跑到中间去
         self._draw_check(canvas, done,
                          top=self.row_pad_y + (main_h - self.check_box) // 2)
         text_color = C_DONE if done else (C_WAIT if canvas._waiting else C_TEXT)
         for index, line in enumerate(lines):
             canvas.create_text(self.text_x, self.row_pad_y + index * line_h, text=line,
-                               anchor="nw", fill=text_color, font=font)
-        canvas._steps_count_item = None
-        if count_text and lines:
-            count_x = self.text_x + font.measure(lines[-1]) + self.px(6)
-            canvas._steps_count_item = canvas.create_text(
-                count_x, self.row_pad_y + (len(lines) - 1) * line_h + line_h / 2.0,
-                text=count_text, anchor="w",
-                fill=C_ACCENT if done_steps >= total_steps else C_DIM,
-                font=count_font, tags="step")
+                               anchor="nw", fill=text_color, font=font, tags="text")
         canvas._step_boxes = self._draw_steps(canvas, steps, self.row_pad_y + main_h, step_h)
         canvas._steps_done, canvas._steps_total = done_steps, total_steps
         canvas._markers = {
-            "prio": self._draw_prio_marker(canvas, row_h),
-            "today": self._draw_today_marker(canvas, row_h),
-            "wait": self._draw_wait_marker(canvas, row_h),
             "delete": self._draw_delete_marker(canvas, row_h),
+            "steps": self._draw_steps_marker(canvas, row_h, done_steps, total_steps),
         }
         canvas._delete_item = canvas._markers["delete"][0][0]   # 兼容旧引用
         self._paint_markers(canvas, None)
@@ -2354,42 +2368,13 @@ class TodoWidget(object):
             right -= width
         return None
 
-    def _draw_prio_marker(self, canvas, row_h):
-        """优先级旗子：一根杆 + 一面三角形旗（实心/空心由 _paint_markers 决定）。"""
-        cx, cy = self._marker_center("prio", row_h)
-        size = float(self.px(11))
-        width = max(1.0, self.s)
-        pole_x = cx - size * 0.36
-        top = cy - size * 0.5
-        bottom = cy + size * 0.55
-        pole = canvas.create_line(pole_x, top, pole_x, bottom, width=width,
-                                  capstyle="round", tags="marker")
-        flag = canvas.create_polygon(pole_x, top + size * 0.02,
-                                     pole_x + size * 0.72, top + size * 0.26,
-                                     pole_x, top + size * 0.5,
-                                     outline=C_MUTED, fill="", width=width,
-                                     tags="marker")
-        return ((pole, "line"), (flag, "poly"))
-
-    def _draw_today_marker(self, canvas, row_h):
-        """「今天要办的」按钮：画一个「今」字（比画图形更好认，也不依赖 emoji 字体）。"""
-        cx, cy = self._marker_center("today", row_h)
-        text_id = canvas.create_text(cx, cy, text="今", fill=C_MUTED,
+    def _draw_steps_marker(self, canvas, row_h, done, total):
+        """「子步骤」按钮：没有子步骤时画 ≡，有子步骤时画 已完成/总数。"""
+        cx, cy = self._marker_center("steps", row_h)
+        text = ("%d/%d" % (done, total)) if total else "≡"
+        text_id = canvas.create_text(cx, cy, text=text, fill=C_MUTED,
                                      font=self.fonts["marker"], tags="marker")
         return ((text_id, "text"),)
-
-    def _draw_wait_marker(self, canvas, row_h):
-        """「等待中」按钮：一个小钟（圆环 + 两根指针）。"""
-        cx, cy = self._marker_center("wait", row_h)
-        radius = float(self.px(6))
-        width = max(1.0, self.s)
-        ring = canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
-                                  outline=C_MUTED, width=width, tags="marker")
-        hand_h = canvas.create_line(cx, cy, cx, cy - radius * 0.55, width=width,
-                                    capstyle="round", tags="marker")
-        hand_m = canvas.create_line(cx, cy, cx + radius * 0.5, cy + radius * 0.35,
-                                    width=width, capstyle="round", tags="marker")
-        return ((ring, "oval"), (hand_h, "line"), (hand_m, "line"))
 
     def _draw_delete_marker(self, canvas, row_h):
         """删除按钮：×（原来那个位置和判定都没变）。"""
@@ -2413,33 +2398,21 @@ class TodoWidget(object):
                 return
 
     def _paint_markers(self, canvas, hover_zone):
-        """按状态 + 悬停给右侧按钮上色（悬停时预演"点下去会变成什么"）。"""
+        """给右侧两个按钮上色（子步骤格：无步骤＝≡灰、部分＝暗、全完成＝强调色）。"""
         markers = getattr(canvas, "_markers", None)
         if not markers:
             return
-        priority = getattr(canvas, "_prio", PRIORITY_NONE)
-        if priority == PRIORITY_HIGH:
-            color, filled = C_HIGH, True
-        elif priority == PRIORITY_MID:
-            color, filled = C_HIGH, False
+        total = getattr(canvas, "_steps_total", 0)
+        done = getattr(canvas, "_steps_done", 0)
+        if not total:
+            color = C_MUTED
+        elif done >= total:
+            color = C_ACCENT
         else:
-            color, filled = C_MUTED, False
-        if hover_zone == "prio":
-            color, filled = C_HIGH, priority != PRIORITY_HIGH
-        self._colorize(canvas, markers["prio"], color, filled)
-
-        marked = bool(getattr(canvas, "_today", False))
-        color = C_ACCENT if marked else C_MUTED
-        if hover_zone == "today":
-            color = C_MUTED if marked else C_ACCENT
-        self._colorize(canvas, markers["today"], color)
-
-        waiting = bool(getattr(canvas, "_waiting", False))
-        color = C_WAIT if waiting else C_MUTED
-        if hover_zone == "wait":
-            color = C_MUTED if waiting else C_WAIT
-        self._colorize(canvas, markers["wait"], color)
-
+            color = C_DIM
+        if hover_zone == "steps":
+            color = C_ACCENT
+        self._colorize(canvas, markers["steps"], color)
         self._colorize(canvas, markers["delete"],
                        C_DANGER if hover_zone == "delete" else C_MUTED)
 
@@ -2546,12 +2519,8 @@ class TodoWidget(object):
             return                       # 松手时指针得还在同一个按钮上才算数
         if zone == "delete":
             self.remove_item(press["id"])
-        elif zone == "wait":
-            self.toggle_waiting_item(press["id"])
-        elif zone == "today":
-            self.toggle_today_item(press["id"])
-        elif zone == "prio":
-            self.cycle_priority_item(press["id"])
+        elif zone == "steps":
+            self._begin_steps_edit(press["id"])
 
     def _begin_drag(self, item_id):
         self._cancel_regroup()               # 拖动期间别归位（归位会重建行，拖到一半会乱）
@@ -2864,6 +2833,15 @@ class TodoWidget(object):
         self._update_footer()
         return item
 
+    def set_priority_item(self, item_id, value):
+        """右键菜单里选了优先级：重画那一行。"""
+        item = self.store.set_priority(item_id, value)
+        if item is None:
+            return None
+        if not self._redraw_row(item_id):
+            self._refresh()
+        return item
+
     def toggle_step_item(self, item_id, index):
         """勾选一个子步骤：只重画那一行；不动主条目的状态，也不参与排序。"""
         item = self.store.toggle_step(item_id, index)
@@ -3028,18 +3006,45 @@ class TodoWidget(object):
         self._schedule_regroup()             # 编辑结束再归位（编辑中归位会把输入框销毁）
         return changed
 
-    def _popup_row_menu(self, event, item_id):
-        """右键条目：目前只有「编辑子步骤」，以后要加别的行内动作也放这儿。"""
+    def _build_row_menu(self, item_id):
+        """右键条目的菜单。右侧图标区删掉的动作都搬到这里（拆出来是为了自检能查它）。"""
         item = self._find_item(item_id)
         if item is None:
-            return
-        done, total = self.store.steps_progress(item)
-        label = "编辑子步骤…" if not total else "编辑子步骤（%d/%d 已完成）…" % (done, total)
+            return None
         menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label=label, command=lambda: self._begin_steps_edit(item_id))
+        waiting = self.store.state_of(item) == STATE_WAITING
+        menu.add_command(label="取消「等待中」" if waiting else "标记为「等待中」",
+                         command=lambda: self.toggle_waiting_item(item_id))
+        marked = bool(item.get("today"))
+        menu.add_command(label="取消「今天要办的」" if marked else "标记为「今天要办的」",
+                         command=lambda: self.toggle_today_item(item_id))
+        priority = self.store.priority_of(item)
+        prio_names = {PRIORITY_NONE: "无", PRIORITY_MID: "中", PRIORITY_HIGH: "高"}
+        prio_menu = tk.Menu(menu, tearoff=0)
+        prio_var = tk.IntVar(master=self.root, value=priority)
+        menu._prio_var = prio_var                 # 别让 IntVar 被回收
+        for label, value in (("高", PRIORITY_HIGH), ("中", PRIORITY_MID),
+                             ("无", PRIORITY_NONE)):
+            prio_menu.add_radiobutton(label=label, value=value, variable=prio_var,
+                                      command=lambda v=value: self.set_priority_item(item_id, v))
+        menu.add_cascade(label="优先级（现在是%s）" % prio_names.get(priority, "无"),
+                         menu=prio_menu)
+        done, total = self.store.steps_progress(item)
+        menu.add_separator()
+        menu.add_command(label=("编辑子步骤…" if not total
+                                else "编辑子步骤（%d/%d 已完成）…" % (done, total)),
+                         command=lambda: self._begin_steps_edit(item_id))
         if total:
             menu.add_command(label="清空子步骤",
                              command=lambda: self._clear_steps(item_id))
+        menu.add_separator()
+        menu.add_command(label="删除这条", command=lambda: self.remove_item(item_id))
+        return menu
+
+    def _popup_row_menu(self, event, item_id):
+        menu = self._build_row_menu(item_id)
+        if menu is None:
+            return
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -3523,37 +3528,54 @@ def run_check():
             if [item["text"] for item in broken.items] != order_before:
                 problems.append("撤销删除后内容或顺序不一致")
             widget._refresh()
-            # 「等待」按钮：点它只改这一行，并且必须原地重画成琥珀色
-            wait_x = widget.list_w - widget.del_w - widget.wait_w // 2
+            # 「等待中」：格子已删，改从右键菜单切；切完那一行必须原地重画成琥珀字
             row_wait = widget._row_widget(target["id"])
-            widget._row_press(_StubEvent(x=wait_x), target["id"])
-            widget._row_release(_StubEvent(x=wait_x))
-            if widget.store.state_of(target) != STATE_WAITING:
-                problems.append("点「等待」按钮没有切到等待中")
-            if widget._row_widget(target["id"]) is not row_wait:
-                problems.append("标记等待中时行控件被重建了（双击会因此失效）")
-            if target["done"]:
-                problems.append("等待中不该同时是已完成")
-            ring = ((getattr(row_wait, "_markers", None) or {}).get("wait") or ((None,),))[0][0]
-            if ring is None or str(row_wait.itemcget(ring, "outline")) != C_WAIT:
-                problems.append("等待中的那一行小钟没有变成琥珀色（说明没重画）")
-            # 在钟上按下、移出去再松手 → 不该改状态
-            widget._row_press(_StubEvent(x=wait_x), target["id"])
-            widget._row_release(_StubEvent(x=widget.text_x))
-            if widget.store.state_of(target) != STATE_WAITING:
-                problems.append("在钟上按下但移出后松手，不该改状态")
-            widget._row_press(_StubEvent(x=wait_x), target["id"])   # 再点一次 → 未完成
-            widget._row_release(_StubEvent(x=wait_x))
-            if widget.store.state_of(target) != STATE_TODO:
-                problems.append("再点一次「等待」按钮没有回到未完成")
-            if Store(path).state_of(
-                    [i for i in Store(path).items if i["id"] == target["id"]][0]) != STATE_TODO:
-                problems.append("等待状态没有落盘")
+
+            def menu_label(menu_now, index):
+                """取菜单项标签；分隔线没有 -label 选项，返回空串。"""
+                try:
+                    return str(menu_now.entrycget(index, "label"))
+                except tk.TclError:
+                    return ""
+
+            def menu_find(menu_now, needle):
+                if menu_now is None:
+                    return None
+                for index in range(menu_now.index("end") + 1):
+                    if needle in menu_label(menu_now, index):
+                        return index
+                return None
+
+            def wait_menu_item(item_id):
+                menu_now = widget._build_row_menu(item_id)
+                return menu_now, menu_find(menu_now, "等待中")
+
+            menu, wait_index = wait_menu_item(target["id"])
+            if wait_index is None:
+                problems.append("右键菜单里没有「等待中」这一项")
+            else:
+                menu.invoke(wait_index)
+                if widget.store.state_of(target) != STATE_WAITING:
+                    problems.append("从菜单标记「等待中」没有生效")
+                if widget._row_widget(target["id"]) is not row_wait:
+                    problems.append("标记等待中时行控件被重建了（双击会因此失效）")
+                if target["done"]:
+                    problems.append("等待中不该同时是已完成")
+                fills = {str(row_wait.itemcget(i, "fill"))
+                         for i in row_wait.find_withtag("text")}
+                if fills != {C_WAIT}:
+                    problems.append("等待中的那一行正文没有变成琥珀色: %r" % (fills,))
+                menu, wait_index = wait_menu_item(target["id"])
+                if wait_index is not None:
+                    menu.invoke(wait_index)
+                if widget.store.state_of(target) != STATE_TODO:
+                    problems.append("从菜单再点一次「等待中」没有回到未完成")
+                if Store(path).state_of(
+                        [i for i in Store(path).items if i["id"] == target["id"]][0]) != STATE_TODO:
+                    problems.append("等待状态没有落盘")
+
             # ---- 子步骤：渲染 + 小方框勾选 + 步骤行保护 + 右键编辑器 ----
-            # 正文用一条"正好顶满行宽"的长文本：这样"进度小字有没有预留宽度"才验得出来
-            base_char = widget.fonts["base"].measure("长") or 1
-            long_text = "长" * max(4, int(widget.row_wrap // base_char))
-            step_item = widget.store.add(long_text)
+            step_item = widget.store.add("带三个子步骤的界面自检条")
             widget.store.set_steps(step_item["id"], ["步骤甲", "步骤乙", "步骤丙"])
             widget._refresh()
             row_steps = widget._row_widget(step_item["id"])
@@ -3562,11 +3584,15 @@ def run_check():
                 problems.append("子步骤没画出三行小方框: %r" % (boxes,))
             else:
                 box_h_before = int(row_steps.cget("height"))
-                count_id = getattr(row_steps, "_steps_count_item", None)
-                if count_id is None or str(row_steps.itemcget(count_id, "text")) != "0/3":
-                    problems.append("子步骤进度没有内联显示成 0/3")
-                elif row_steps.bbox(count_id)[2] > widget._marker_zone_start():
-                    problems.append("行尾的进度小字压到了右侧图标区")
+
+                def steps_cell(row_now):
+                    items = (getattr(row_now, "_markers", None) or {}).get("steps") or ()
+                    return items[0][0] if items else None
+
+                cell = steps_cell(row_steps)
+                if cell is None or str(row_steps.itemcget(cell, "text")) != "0/3":
+                    problems.append("子步骤格子上没有显示 0/3: %r"
+                                    % (row_steps.itemcget(cell, "text") if cell else None,))
                 index, y0, y1, x0, x1 = boxes[1]          # 勾第二个
                 cx = (x0 + x1) // 2
                 cy = (y0 + y1) // 2
@@ -3581,9 +3607,10 @@ def run_check():
                     problems.append("勾子步骤不该把主条目标成已完成")
                 if int(row_steps.cget("height")) != box_h_before:
                     problems.append("勾子步骤不该改变行高")
-                count_id = getattr(row_steps, "_steps_count_item", None)
-                if count_id is None or str(row_steps.itemcget(count_id, "text")) != "1/3":
-                    problems.append("勾完一个后行尾进度应是 1/3")
+                cell = steps_cell(row_steps)
+                if cell is None or str(row_steps.itemcget(cell, "text")) != "1/3":
+                    problems.append("勾完一个后格子上应是 1/3: %r"
+                                    % (row_steps.itemcget(cell, "text") if cell else None,))
                 # 点步骤文字（不是小方框）什么也不该发生
                 step_text_x = widget.text_x + widget.step_indent + 12
                 widget._row_press(_StubEvent(x=step_text_x, y=cy), step_item["id"])
@@ -3638,63 +3665,97 @@ def run_check():
                                     for st in widget.store.steps_of(step_item)])
             widget._refresh()
             row_all = widget._row_widget(step_item["id"])
-            count_id = getattr(row_all, "_steps_count_item", None)
-            if count_id is None or str(row_all.itemcget(count_id, "fill")) != C_ACCENT:
-                problems.append("子步骤全完成时行尾进度应是强调色（id=%r text=%r fill=%r 进度=%r）"
-                                % (count_id,
-                                   row_all.itemcget(count_id, "text") if count_id else None,
-                                   row_all.itemcget(count_id, "fill") if count_id else None,
+            cell_all = steps_cell(row_all)
+            if cell_all is None or str(row_all.itemcget(cell_all, "fill")) != C_ACCENT:
+                problems.append("子步骤全完成时格子应是强调色（text=%r fill=%r 进度=%r）"
+                                % (row_all.itemcget(cell_all, "text") if cell_all else None,
+                                   row_all.itemcget(cell_all, "fill") if cell_all else None,
                                    widget.store.steps_progress(step_item)))
             # 收尾：删掉这条测试条目，后面用例面对的还是原来的列表
             widget.store.pop(step_item["id"])
             widget._refresh()
 
-            # ---- 优先级旗子 / 今天按钮 ----
+            # ---- 右侧图标区只许有「子步骤」与「删除」（钟/今/旗已删）----
             mark_item = broken.items[0]
-            prio_x = widget.list_w - widget.del_w - widget.wait_w - widget.today_w \
-                - widget.prio_w // 2
-            today_x = widget.list_w - widget.del_w - widget.wait_w - widget.today_w // 2
             row_mark = widget._row_widget(mark_item["id"])
-            widget._row_press(_StubEvent(x=prio_x), mark_item["id"])
-            widget._row_release(_StubEvent(x=prio_x))
-            if widget.store.priority_of(mark_item) != PRIORITY_HIGH:
-                problems.append("点旗子没有把优先级设成高")
-            if widget._row_widget(mark_item["id"]) is not row_mark:
-                problems.append("改优先级时行控件被重建了（双击会因此失效）")
-            # 注意：_draw_row 里 delete("all") 之后图元 id 会变，每次都要重新取
-            flag = row_mark._markers["prio"][1][0]
-            if str(row_mark.itemcget(flag, "fill")) != C_HIGH:
-                problems.append("高优先级旗子应是实心橙: %r"
-                                % (row_mark.itemcget(flag, "fill"),))
-            widget._row_press(_StubEvent(x=prio_x), mark_item["id"])
-            widget._row_release(_StubEvent(x=prio_x))
-            if widget.store.priority_of(mark_item) != PRIORITY_MID:
-                problems.append("再点旗子应变成中优先级")
-            flag = row_mark._markers["prio"][1][0]
-            if str(row_mark.itemcget(flag, "fill")) not in ("", "none"):
-                problems.append("中优先级旗子应是空心: %r"
-                                % (row_mark.itemcget(flag, "fill"),))
-            if str(row_mark.itemcget(flag, "outline")) != C_HIGH:
-                problems.append("中优先级旗子边框应是橙色: %r"
-                                % (row_mark.itemcget(flag, "outline"),))
-            widget._row_press(_StubEvent(x=prio_x), mark_item["id"])
-            widget._row_release(_StubEvent(x=widget.text_x))
-            if widget.store.priority_of(mark_item) != PRIORITY_MID:
-                problems.append("在旗子上按下但移出后松手，不该改优先级")
-            widget._row_press(_StubEvent(x=today_x), mark_item["id"])
-            widget._row_release(_StubEvent(x=today_x))
-            if not mark_item.get("today"):
-                problems.append("点「今」没有标记今天")
-            today_text = row_mark._markers["today"][0][0]   # 同上：重画后重新取
-            if str(row_mark.itemcget(today_text, "fill")) != C_ACCENT:
-                problems.append("今天的「今」应是蓝色: %r"
-                                % (row_mark.itemcget(today_text, "fill"),))
-            if "今天" not in str(widget.hint.cget("text")):
-                problems.append("底部没有显示今天进度: %r" % (widget.hint.cget("text"),))
-            widget._row_press(_StubEvent(x=today_x), mark_item["id"])
-            widget._row_release(_StubEvent(x=today_x))
-            if mark_item.get("today"):
-                problems.append("再点「今」应取消今天标记")
+            zones = set((getattr(row_mark, "_markers", None) or {}).keys())
+            if zones != {"delete", "steps"}:
+                problems.append("右侧图标区应当只有 子步骤+删除，实际画了: %r" % (zones,))
+            table = [name for name, _width in widget.markers]
+            if table != ["delete", "steps"]:
+                problems.append("尺寸表/点击判定里的格子应当只有 子步骤+删除，实际: %r"
+                                % (table,))
+            # 行为面：老格子所在的位置不该再被判成 wait/today/prio 区
+            probes = [widget.list_w - widget.del_w - widget.wait_w // 2,
+                      widget.list_w - widget.del_w - widget.wait_w - widget.today_w // 2,
+                      widget.list_w - widget.del_w - widget.wait_w - widget.today_w \
+                      - widget.prio_w // 2]
+            for probe_x in probes:
+                got_zone = widget._zone_at(probe_x)
+                if got_zone in ("wait", "today", "prio"):
+                    problems.append("x=%s 还被判成已删除的按钮区: %r" % (probe_x, got_zone))
+            # 优先级：菜单里选 → 行左侧竖条（高＝整行、中＝半行、无＝不画）
+            menu = widget._build_row_menu(mark_item["id"])
+            cascade = [i for i in range(menu.index("end") + 1)
+                       if "优先级" in menu_label(menu, i)]
+            if not cascade:
+                problems.append("右键菜单里没有「优先级」子菜单")
+            else:
+                sub = menu.nametowidget(menu.entrycget(cascade[0], "menu"))
+                sub.invoke(0)                                  # 第一项 ＝ 高
+                if widget.store.priority_of(mark_item) != PRIORITY_HIGH:
+                    problems.append("菜单里选「高」没有生效: %r"
+                                    % (widget.store.priority_of(mark_item),))
+                if widget._row_widget(mark_item["id"]) is not row_mark:
+                    problems.append("改优先级时行控件被重建了（双击会因此失效）")
+                bars = row_mark.find_withtag("prio")
+                row_h_now = int(row_mark.cget("height"))
+                if len(bars) != 1 or str(row_mark.itemcget(bars[0], "fill")) != C_HIGH:
+                    problems.append("高优先级应当在行左侧画一条实心橙竖条: %r" % (bars,))
+                elif row_mark.bbox(bars[0])[3] - row_mark.bbox(bars[0])[1] < row_h_now * 0.8:
+                    problems.append("高优先级的竖条应当是整行高: %r"
+                                    % (row_mark.bbox(bars[0]),))
+                sub.invoke(1)                                  # 中
+                if widget.store.priority_of(mark_item) != PRIORITY_MID:
+                    problems.append("菜单里选「中」没有生效")
+                bars = row_mark.find_withtag("prio")
+                if len(bars) != 1:
+                    problems.append("中优先级也该有一条竖条: %r" % (bars,))
+                elif row_mark.bbox(bars[0])[3] - row_mark.bbox(bars[0])[1] > row_h_now * 0.7:
+                    problems.append("中优先级的竖条应当只有半行高: %r"
+                                    % (row_mark.bbox(bars[0]),))
+                sub.invoke(2)                                  # 无
+                if widget.store.priority_of(mark_item) != PRIORITY_NONE \
+                        or row_mark.find_withtag("prio"):
+                    problems.append("选「无」之后竖条应当消失")
+            # 今天：菜单里标记 → 正文前一个蓝点；底部显示今天进度
+            menu = widget._build_row_menu(mark_item["id"])
+
+            today_index = menu_find(menu, "今天")
+            if today_index is None:
+                problems.append("右键菜单里没有「今天要办的」")
+            else:
+                menu.invoke(today_index)
+                if not mark_item.get("today"):
+                    problems.append("从菜单标记「今天要办的」没有生效")
+                dots = row_mark.find_withtag("today")
+                if len(dots) != 1 or str(row_mark.itemcget(dots[0], "fill")) != C_ACCENT:
+                    problems.append("今天的条目前面应当有一个蓝点: %r" % (dots,))
+                if "今天" not in str(widget.hint.cget("text")):
+                    problems.append("底部没有显示今天进度: %r" % (widget.hint.cget("text"),))
+                menu = widget._build_row_menu(mark_item["id"])
+                today_index = menu_find(menu, "今天")
+                if today_index is not None:
+                    menu.invoke(today_index)
+                if mark_item.get("today"):
+                    problems.append("再从菜单点一次「今天要办的」应取消标记")
+            # 菜单里该有的动作都在（删除不真的点，免得弹出撤销条影响后面的提示断言）
+            menu = widget._build_row_menu(mark_item["id"])
+            labels = " ".join(menu_label(menu, i)
+                              for i in range(menu.index("end") + 1))
+            for wanted in ("等待中", "今天要办的", "优先级", "编辑子步骤", "删除这条"):
+                if wanted not in labels:
+                    problems.append("右键菜单缺少「%s」: %r" % (wanted, labels))
             probe = {"id": -1, "text": "x", "done": False, "state": STATE_TODO,
                      "priority": PRIORITY_NONE, "today": False}
             if widget._bucket_of(probe) == widget._bucket_of(dict(probe, priority=PRIORITY_HIGH)):
