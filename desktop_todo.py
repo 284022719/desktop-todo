@@ -40,6 +40,7 @@
 
 import argparse
 import json
+import re
 import ctypes
 import os
 import shutil
@@ -84,6 +85,9 @@ ROW_PAD_Y = 6          # 条目上下内边距
 ROW_WRAP = LIST_W - TEXT_X - DEL_W - 4  # 条目文字换行宽度
 UNDO_SECONDS = 8       # 删除后「撤销」保留的秒数
 ARCHIVE_MAX = 500      # 归档最多留多少条（超了丢最老的）
+TAG_MAX = 3            # 一条最多几个情境标签
+TAG_LEN = 8            # 单个标签最长几个字
+TAG_RE = re.compile(r"(?:^|\s)@([\w\u4e00-\u9fff]{1,%d})(?=\s|$)" % TAG_LEN)
 DOUBLE_CLICK_REVERT_S = 0.8   # 双击进入编辑时，把第一次单击的勾选撤回的时间窗
 
 # 条目状态：未完成 / 等待中 / 已完成
@@ -1470,6 +1474,7 @@ class Store(object):
                     "id": item_id,
                     "text": text,
                     "steps": self._clean_steps(entry.get("steps")),
+                    "tags": self.tags_of(entry),
                     "done_at": self._load_done_at(entry, state),
                     "done": state == STATE_DONE,
                     "state": state,
@@ -1527,10 +1532,11 @@ class Store(object):
     # ---- 条目操作 ----
     def add(self, text):
         """新增一条（插到最前）；空文本返回 None。"""
-        text = " ".join(str(text).split())
+        text, tags = self.parse_tags(text)
         if not text:
             return None
-        item = {"id": self._next_id, "text": text, "steps": [], "done": False,
+        item = {"id": self._next_id, "text": text, "steps": [], "tags": tags,
+                "done": False,
                 "state": STATE_TODO, "priority": PRIORITY_NONE, "today": False,
                 "done_at": None, "created": time.time()}
         self._next_id += 1
@@ -1567,6 +1573,51 @@ class Store(object):
                 return self._set_state(
                     item, STATE_TODO if state == STATE_WAITING else STATE_WAITING)
         return None
+
+    @classmethod
+    def parse_tags(cls, text):
+        """从文字里摘出 `@情境`，返回（去掉标签的正文, 标签列表）。
+
+        规矩（都是为了不误伤普通文字）：`@` 前面必须是空白或开头；后面 1–8 个中英文/数字；
+        再后面必须是空白或结尾。所以 `邮箱@qq.com`、`@qq.com` 这种都不会被当标签。
+        重复的标签去掉；超过 TAG_MAX 个的留在正文里，不悄悄吃掉。
+        """
+        tags = []
+
+        def take(match):
+            tag = match.group(1)
+            if tag in tags:
+                return ""
+            if len(tags) >= TAG_MAX:
+                return match.group(0)
+            tags.append(tag)
+            return ""
+
+        cleaned = " ".join(TAG_RE.sub(take, " " + str(text) + " ").split())
+        return cleaned, tags
+
+    @staticmethod
+    def tags_of(item):
+        """取标签（兼容老数据）：去重、限个数、限长度。"""
+        raw = item.get("tags")
+        tags = []
+        if isinstance(raw, list):
+            for entry in raw:
+                tag = " ".join(str(entry).split())[:TAG_LEN]
+                if tag and tag not in tags:
+                    tags.append(tag)
+                if len(tags) >= TAG_MAX:
+                    break
+        return tags
+
+    def all_tags(self):
+        """出现过的全部标签（按出现次数多的在前）。"""
+        counts = {}
+        for item in self.items:
+            for tag in self.tags_of(item):
+                counts[tag] = counts.get(tag, 0) + 1
+        return [tag for tag, _count in sorted(counts.items(),
+                                             key=lambda pair: (-pair[1], pair[0]))]
 
     @staticmethod
     def _clean_steps(raw):
@@ -1732,14 +1783,15 @@ class Store(object):
 
     def rename(self, item_id, text):
         """改条目文字（压掉首尾与多余空白）；空文本不生效。返回是否真的改了。"""
-        cleaned = " ".join(str(text).split())
+        cleaned, tags = self.parse_tags(text)
         if not cleaned:
             return False
         for item in self.items:
             if item["id"] == item_id:
-                if item["text"] == cleaned:
+                if item["text"] == cleaned and self.tags_of(item) == tags:
                     return False
                 item["text"] = cleaned
+                item["tags"] = tags
                 self.save()
                 return True
         return False
@@ -1848,12 +1900,14 @@ class Store(object):
             return before - len(self.items)
         return 0
 
-    def remaining(self):
-        """还没完成的条数（等待中算没完成 —— 事情确实还没了）。"""
-        return len([item for item in self.items if self.state_of(item) != STATE_DONE])
+    def remaining(self, items=None):
+        """还没完成的条数（等待中算没完成 —— 事情确实还没了）。items 给子集时就只数子集。"""
+        items = self.items if items is None else items
+        return len([item for item in items if self.state_of(item) != STATE_DONE])
 
-    def waiting_count(self):
-        return len([item for item in self.items if self.state_of(item) == STATE_WAITING])
+    def waiting_count(self, items=None):
+        items = self.items if items is None else items
+        return len([item for item in items if self.state_of(item) == STATE_WAITING])
 
     def has_done(self):
         return any(item["done"] for item in self.items)
@@ -2080,7 +2134,9 @@ class TodoWidget(object):
         self.card.pack(fill="both", expand=True, padx=1, pady=1)
 
         self._build_header()
+        self.filter_tag = None            # 顶部情境筛选：None = 看全部
         self._build_input()
+        self._build_tags()
         self._build_list()
         self._build_footer()
         self.menu = self._build_menu()
@@ -2116,6 +2172,50 @@ class TodoWidget(object):
             widget.bind("<ButtonRelease-1>", self._drag_end)
             widget.bind("<Button-3>", self._popup_menu)
         head.bind("<Double-Button-1>", lambda event: self.toggle_collapsed())
+
+    def _build_tags(self):
+        """顶部情境筛选条：只在有标签时才长出内容（没标签时是个空框，高度≈0）。"""
+        self.tags_row = tk.Frame(self.card, bg=C_CARD)
+        self.tags_row.pack(fill="x", padx=self.pad, pady=(0, self.px(2)))
+
+    def _refresh_tags(self):
+        for child in list(self.tags_row.winfo_children()):
+            child.destroy()
+        tags = self.store.all_tags()
+        if not tags:
+            self.filter_tag = None
+            return
+        self._tag_chip("全部", None)
+        for tag in tags:
+            self._tag_chip("@" + tag, tag)
+
+    def _tag_chip(self, label, tag):
+        active = (self.filter_tag == tag)
+        chip = tk.Label(self.tags_row, text=label, bg=C_LIST,
+                        fg=C_ACCENT if active else C_DIM,
+                        font=self.fonts["small"], padx=self.px(6), pady=self.px(1))
+        chip.pack(side="left", padx=(0, self.px(4)))
+        if active:
+            chip.configure(highlightbackground=C_ACCENT, highlightthickness=1)
+        chip.bind("<Button-1>", lambda event, t=tag: self.set_filter(t))
+        chip.bind("<Enter>", lambda event: chip.configure(fg=C_ACCENT))
+        chip.bind("<Leave>", lambda event: chip.configure(
+            fg=C_ACCENT if active else C_DIM))
+        return chip
+
+    def set_filter(self, tag):
+        """切换「只看某个情境」；tag=None 表示看全部。"""
+        self.filter_tag = tag
+        self._refresh_tags()
+        self._refresh(keep_scroll=False)
+        self._update_counts()
+        self._update_footer()
+
+    def _visible_items(self):
+        if not self.filter_tag:
+            return list(self.store.items)
+        return [item for item in self.store.items
+                if self.filter_tag in self.store.tags_of(item)]
 
     def _build_input(self):
         self.input_row = row = tk.Frame(self.card, bg=C_CARD)
@@ -2296,13 +2396,16 @@ class TodoWidget(object):
         self._pointer_y = None
         self._stop_autoscroll()
 
-        if not self.store.items:
-            empty = tk.Label(self.inner, text="暂无待办，在上面输入框添加第一条",
+        visible = self._visible_items()
+        if not visible:
+            empty = tk.Label(self.inner,
+                             text=("没有 @%s 的条目" % self.filter_tag) if self.filter_tag
+                             else "暂无待办，在上面输入框添加第一条",
                              bg=C_LIST, fg=C_MUTED, font=self.fonts["small"])
             empty.pack(fill="x", pady=self.px(20))
             self._bind_wheel(empty)
         else:
-            for item in self.store.items:
+            for item in visible:
                 self._make_row(item)
 
         self._update_counts()
@@ -2349,7 +2452,12 @@ class TodoWidget(object):
         line_h = font.metrics("linespace")
         steps = self.store.steps_of(item)
         done_steps, total_steps = self.store.steps_progress(item)
-        lines = self._wrap_text(item["text"], font, self.row_wrap)
+        tags = self.store.tags_of(item)
+        tag_text = " ".join("@" + tag for tag in tags)
+        tag_font = self.fonts["marker"]
+        tag_w = (tag_font.measure(tag_text) + self.px(6)) if tag_text else 0
+        lines = self._wrap_text(item["text"], font,
+                               max(self.px(40), self.row_wrap - tag_w))
         step_h = self.fonts["small"].metrics("linespace") + self.px(2)
         step_wrap = max(self.px(40), self.row_wrap - self.step_indent)
         step_rows = 0
@@ -2384,6 +2492,12 @@ class TodoWidget(object):
         for index, line in enumerate(lines):
             canvas.create_text(self.text_x, self.row_pad_y + index * line_h, text=line,
                                anchor="nw", fill=text_color, font=font, tags="text")
+        canvas._tag_item = None
+        if tag_text and lines:
+            canvas._tag_item = canvas.create_text(
+                self.text_x + font.measure(lines[-1]) + self.px(6),
+                self.row_pad_y + (len(lines) - 1) * line_h + line_h / 2.0,
+                text=tag_text, anchor="w", fill=C_ACCENT, font=tag_font, tags="tag")
         canvas._step_boxes = self._draw_steps(canvas, steps, self.row_pad_y + main_h, step_h)
         canvas._steps_done, canvas._steps_total = done_steps, total_steps
         canvas._markers = {
@@ -2750,9 +2864,11 @@ class TodoWidget(object):
         self._start_autoscroll()
 
     def _update_counts(self):
-        remaining = self.store.remaining()
-        waiting = self.store.waiting_count()
-        if self.store.items and remaining == 0:
+        self._refresh_tags()
+        visible = self._visible_items()
+        remaining = self.store.remaining(visible)
+        waiting = self.store.waiting_count(visible)
+        if visible and remaining == 0:
             text = "全部完成"
         elif waiting:
             text = "%d 项未完成 · %d 等待" % (remaining, waiting)
@@ -2791,6 +2907,11 @@ class TodoWidget(object):
         """底部提示：折叠时提示展开，条目够多时提示可拖动排序 / 双击可改。"""
         if self._undo is not None:
             return                     # 正在显示「已删除…＋撤销」，别把它覆盖掉
+        if self.filter_tag:
+            self.hint.configure(text="只看 @%s（%d 条）· 点上面的「全部」取消"
+                                     % (self.filter_tag, len(self._visible_items())),
+                                fg=C_ACCENT)
+            return
         if self.store.ui["collapsed"]:
             text = "双击标题展开"
         elif self.store.today_stats()[1]:
@@ -3082,7 +3203,8 @@ class TodoWidget(object):
         entry = tk.Entry(widget, bg=C_BORDER, fg=C_TEXT, insertbackground=C_TEXT,
                          relief="flat", bd=0, font=self.fonts["base"],
                          highlightthickness=0)
-        entry.insert(0, item["text"])
+        tags = self.store.tags_of(item)
+        entry.insert(0, item["text"] + (" " + " ".join("@" + t for t in tags) if tags else ""))
         entry.select_range(0, "end")
         height = int(widget.cget("height"))
         entry.place(x=self.text_x - self.px(2), y=self.px(2),
@@ -3875,6 +3997,74 @@ def run_check():
                 problems.append("优先级没有参与排序桶")
             if widget._bucket_of(probe) == widget._bucket_of(dict(probe, today=True)):
                 problems.append("「今天」没有参与排序桶")
+
+            # ---- 情境标签：@ 解析 / 行尾显示 / 顶部筛选 ----
+            tg = Store(os.path.join(temp_dir, "tags.json"))
+            if Store.parse_tags("写周报") != ("写周报", []):
+                problems.append("没标签的文字不该被改动")
+            if Store.parse_tags("给彭老师打电话 @电话 @外出") != ("给彭老师打电话",
+                                                              ["电话", "外出"]):
+                problems.append("@ 解析不对: %r"
+                                % (Store.parse_tags("给彭老师打电话 @电话 @外出"),))
+            t2_text, t2_tags = Store.parse_tags("@电话 交资料 @电话 @家 @单位 @超出的")
+            if t2_tags != ["电话", "家", "单位"] or "@超出的" not in t2_text:
+                problems.append("标签去重/上限不对: %r" % ((t2_text, t2_tags),))
+            t3_text, t3_tags = Store.parse_tags("邮箱@qq.com 和 a.com/x@y")
+            if t3_tags or "@qq.com" not in t3_text:
+                problems.append("邮箱/网址不该被当成标签: %r" % ((t3_text, t3_tags),))
+            ti = tg.add("催白内障补贴 @电话")
+            if ti["text"] != "催白内障补贴" or Store.tags_of(ti) != ["电话"]:
+                problems.append("add 没有把 @标签 摘进 tags: %r" % (ti,))
+            tg.rename(ti["id"], "催白内障补贴 @电话 @外出")
+            if Store.tags_of(ti) != ["电话", "外出"]:
+                problems.append("rename 没有更新标签: %r" % (Store.tags_of(ti),))
+            tg.rename(ti["id"], "催白内障补贴")
+            if Store.tags_of(ti) != []:
+                problems.append("删掉 @标签 后 tags 应当为空: %r" % (Store.tags_of(ti),))
+            tg.rename(ti["id"], "催白内障补贴 @电话")
+            tg.add("买菜 @外出")
+            if sorted(tg.all_tags()) != ["外出", "电话"]:
+                problems.append("all_tags 不对: %r" % (tg.all_tags(),))
+            reload_tags = Store(os.path.join(temp_dir, "tags.json"))
+            got_tags = sorted(tag for item in reload_tags.items
+                              for tag in Store.tags_of(item))
+            if got_tags != ["外出", "电话"]:
+                problems.append("标签没有落盘: %r" % (got_tags,))
+            # 界面：正文顶满一行时，行尾标签也不许压到右侧图标区
+            base_char = widget.fonts["base"].measure("长") or 1
+            long_text = "长" * max(4, int(widget.row_wrap // base_char))
+            tagged = widget.store.add(long_text + " @电话")
+            no_tag_item = widget.store.add("界面无标签条")
+            widget._refresh()
+            row_tag = widget._row_widget(tagged["id"])
+            tag_item = getattr(row_tag, "_tag_item", None)
+            if tag_item is None or str(row_tag.itemcget(tag_item, "text")) != "@电话":
+                problems.append("行尾没有画出 @电话 标签: %r" % (tag_item,))
+            elif row_tag.bbox(tag_item)[2] > widget._marker_zone_start():
+                problems.append("行尾标签压到了右侧图标区")
+            if not widget.tags_row.winfo_children():
+                problems.append("有标签时顶部筛选条没有生成筛选项")
+            widget.set_filter("电话")
+            if [i["id"] for i in widget._visible_items()] != [tagged["id"]]:
+                problems.append("筛选后可见条目不对: %r"
+                                % ([i["text"][:6] for i in widget._visible_items()],))
+            if "只看 @电话" not in str(widget.hint.cget("text")):
+                problems.append("筛选时底部没有提示: %r" % (widget.hint.cget("text"),))
+            if widget.store.remaining(widget._visible_items()) != 1:
+                problems.append("筛选后的计数不对")
+            widget.set_filter(None)
+            if len(widget._visible_items()) != len(widget.store.items):
+                problems.append("取消筛选后应当看到全部")
+            widget._begin_edit(tagged["id"])
+            shown = widget._edit_entry.get() if widget._edit_entry is not None else ""
+            if "@电话" not in shown:
+                problems.append("编辑框没有回填 @电话: %r" % (shown,))
+            widget._end_edit(save=True)
+            if Store.tags_of(tagged) != ["电话"]:
+                problems.append("编辑保存后标签丢了: %r" % (Store.tags_of(tagged),))
+            for extra_id in (tagged["id"], no_tag_item["id"]):
+                widget.store.pop(extra_id)
+            widget._refresh()
 
             # ---- 归档：过 00:00 自动收走已完成的；删除进归档、可撤销 ----
             arc_path = os.path.join(temp_dir, "archive.json")
