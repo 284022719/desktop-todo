@@ -3317,6 +3317,8 @@ class TodoWidget(object):
         box.bind("<Escape>", lambda event: self._end_steps_edit(save=False))
         box.bind("<Control-Return>", lambda event: self._end_steps_edit(save=True))
         box.bind("<FocusOut>", lambda event: self._end_steps_edit(save=True))
+        self.hint.configure(text="回车=换行 · Ctrl+回车=保存 · Esc=取消 · 点别处也算保存",
+                            fg=C_ACCENT)
         self._steps_edit = (box, item_id)
         try:
             box.focus_force()
@@ -3349,6 +3351,7 @@ class TodoWidget(object):
                 steps.append({"text": line, "done": done})
             changed = self.store.set_steps(item_id, steps) is not None
         self._refresh()
+        self._update_hint()
         self._schedule_regroup()
         return changed
 
@@ -3873,6 +3876,9 @@ def run_check():
                     problems.append("编辑器内容不对: %r" % (text_now,))
                 if widget._redraw_row(step_item["id"]):
                     problems.append("子步骤编辑器开着时不该重画那一行")
+                if "Ctrl+回车" not in str(widget.hint.cget("text")):
+                    problems.append("子步骤编辑器开着时，底部应当提示怎么退出: %r"
+                                    % (widget.hint.cget("text"),))
                 box.delete("1.0", "end")
                 box.insert("end", "步骤甲改了\n步骤丙\n新加的第四步\n")
                 widget._end_steps_edit(save=True)
@@ -3883,6 +3889,9 @@ def run_check():
                     problems.append("按行位置保留勾选这条不对: %r" % (steps_saved,))
                 if widget._steps_edit is not None:
                     problems.append("保存后编辑器引用没清掉")
+                if "Ctrl+回车" in str(widget.hint.cget("text")):
+                    problems.append("编辑器收掉后，底部提示应当恢复: %r"
+                                    % (widget.hint.cget("text"),))
             widget._begin_steps_edit(step_item["id"])
             box = (widget._steps_edit or (None, None))[0]
             if box is not None:
