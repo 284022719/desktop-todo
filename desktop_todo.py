@@ -3316,11 +3316,14 @@ class TodoWidget(object):
         finally:
             menu.grab_release()
 
-    def _dismiss_row_menu(self, event=None):
+    def _dismiss_row_menu(self, *args, **kwargs):
         """收起右键菜单：点别处、再右键、或菜单被选过之后都走这里。
 
-        Tk 自己的"点外部自动收起"在这套无边框窗口上不可靠（实测点空白处菜单不走），
-        所以额外挂一条全局绑定兜底，并且**销毁**菜单控件，免得每次右键都堆一个。
+        签名为什么收 *args：Tk 走 bind_all 时实测会**传两个参数**进来
+        （TypeError: <lambda>() takes 1 positional argument but 2 were given）——
+        收窄成 event 一个参数的话，回调会抛异常、菜单就收不掉了。
+        Tk 自带的"点外部自动收起"在这套无边框窗口上也不可靠（实测点空白处菜单不走），
+        所以额外挂全局绑定兜底，并且**销毁**菜单控件，免得每次右键都堆一个。
         """
         menu, self._row_menu = self._row_menu, None
         if menu is None:
