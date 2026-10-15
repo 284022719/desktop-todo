@@ -2154,9 +2154,10 @@ class TodoWidget(object):
         self._build_footer()
         self.menu = self._build_menu()
         self._row_menu = None                  # 当前弹出的条目右键菜单
-        # 点窗口任何地方（左键或右键）都把条目菜单收起来；没弹出时是空操作
+        # 只挂左键：右键那一下正是"要弹菜单"的动作，若也挂上全局收起，
+        # 就是"先弹出来、紧接着被同一事件的全局处理收掉"——实测菜单根本弹不出来。
+        # （右键点别的条目由 _popup_row_menu 自己先收起上一个。）
         self.root.bind_all("<Button-1>", self._dismiss_row_menu, add="+")
-        self.root.bind_all("<Button-3>", self._dismiss_row_menu, add="+")
         self._archived_day = None
         self._archive_on_start()
 
@@ -3325,9 +3326,14 @@ class TodoWidget(object):
         Tk 自带的"点外部自动收起"在这套无边框窗口上也不可靠（实测点空白处菜单不走），
         所以额外挂全局绑定兜底，并且**销毁**菜单控件，免得每次右键都堆一个。
         """
-        menu, self._row_menu = self._row_menu, None
+        menu = self._row_menu
         if menu is None:
             return
+        event = args[0] if args else None
+        hit = getattr(event, "widget", None)
+        if hit is not None and str(hit).startswith(str(menu)):
+            return                         # 点在菜单自己身上：交给菜单处理，别销毁
+        self._row_menu = None
         try:
             menu.unpost()
         except tk.TclError:
@@ -4007,16 +4013,32 @@ def run_check():
             kp_entry = 'entry.bind("<KP_Enter>"'
             if kp_steps not in src2 or kp_entry not in src2:
                 problems.append("小键盘回车没接上（子步骤框和主文字框都要接 KP_Enter）")
-            if not widget.root.bind_all("<Button-1>") \
-                    or not widget.root.bind_all("<Button-3>"):
+            src3 = open(__file__, encoding="utf-8").read()
+            if not widget.root.bind_all("<Button-1>"):
                 problems.append("没有装「点别处收起右键菜单」的全局绑定")
+            # 拼串查，免得检查自己的字面量把自己喂饱（这个坑栽过一次）
+            bad_global = 'bind_all("<Button-' + '3>"'
+            if bad_global in src3:
+                problems.append("不许全局绑 <Button-3>：右键那一下会把刚弹出的菜单立刻收掉")
             probe_menu = widget._build_row_menu(step_item["id"])
             widget._row_menu = probe_menu
-            widget._dismiss_row_menu()
+            blank = _StubEvent(x=0)
+            blank.widget = widget.inner                 # 模拟"点在空白处"
+            widget._dismiss_row_menu(blank)
             if widget._row_menu is not None:
-                problems.append("收起右键菜单后引用没清掉")
+                problems.append("点空白处没有收起右键菜单（引用没清）")
             elif probe_menu.winfo_exists():
                 problems.append("收起右键菜单后控件没销毁（会越堆越多）")
+            probe_menu2 = widget._build_row_menu(step_item["id"])
+            widget._row_menu = probe_menu2
+            inside = _StubEvent(x=0)
+            inside.widget = probe_menu2                 # 模拟"点在菜单自己身上"
+            widget._dismiss_row_menu(inside)
+            if widget._row_menu is None or not probe_menu2.winfo_exists():
+                problems.append("点在菜单自己身上不该把它销毁（否则菜单项点不动）")
+            widget._dismiss_row_menu()                  # 清干净
+            if widget._row_menu is not None:
+                problems.append("收起菜单后引用没清掉")
             steps_before_add = len(widget.store.steps_of(step_item))
             widget.add_step_item(step_item["id"])
             if len(widget.store.steps_of(step_item)) != steps_before_add + 1:
