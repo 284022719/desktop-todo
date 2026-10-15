@@ -1660,6 +1660,19 @@ class Store(object):
                 return item
         return None
 
+    def add_step(self, item_id, text="新步骤"):
+        """在末尾追加一条子步骤（右键菜单用）；受 STEP_MAX 约束。"""
+        for item in self.items:
+            if item["id"] == item_id:
+                steps = self.steps_of(item)
+                if len(steps) >= STEP_MAX:
+                    return None
+                steps.append({"text": " ".join(str(text).split()) or "新步骤", "done": False})
+                item["steps"] = steps
+                self.save()
+                return item
+        return None
+
     def toggle_step(self, item_id, index):
         """勾选第 index 个子步骤（不动主条目的状态）。"""
         for item in self.items:
@@ -2140,6 +2153,10 @@ class TodoWidget(object):
         self._build_list()
         self._build_footer()
         self.menu = self._build_menu()
+        self._row_menu = None                  # 当前弹出的条目右键菜单
+        # 点窗口任何地方（左键或右键）都把条目菜单收起来；没弹出时是空操作
+        self.root.bind_all("<Button-1>", self._dismiss_row_menu, add="+")
+        self.root.bind_all("<Button-3>", self._dismiss_row_menu, add="+")
         self._archived_day = None
         self._archive_on_start()
 
@@ -3067,6 +3084,15 @@ class TodoWidget(object):
         self._update_footer()
         return item
 
+    def add_step_item(self, item_id):
+        """右键菜单：加一条子步骤，然后重画那一行。"""
+        item = self.store.add_step(item_id)
+        if item is None:
+            return None
+        if not self._redraw_row(item_id):
+            self._refresh()
+        return item
+
     def set_priority_item(self, item_id, value):
         """右键菜单里选了优先级：重画那一行。"""
         item = self.store.set_priority(item_id, value)
@@ -3212,6 +3238,7 @@ class TodoWidget(object):
                               self.list_w - self.text_x - self.del_w - self.px(2)),
                     height=max(self.px(16), height - 2 * self.px(2)))
         entry.bind("<Return>", lambda event: self._end_edit(save=True))
+        entry.bind("<KP_Enter>", lambda event: self._end_edit(save=True))   # 小键盘回车
         entry.bind("<Escape>", lambda event: self._end_edit(save=False))
         entry.bind("<FocusOut>", lambda event: self._end_edit(save=True))
         self._edit_id = item_id
@@ -3269,6 +3296,8 @@ class TodoWidget(object):
         menu.add_command(label=("编辑子步骤…" if not total
                                 else "编辑子步骤（%d/%d 已完成）…" % (done, total)),
                          command=lambda: self._begin_steps_edit(item_id))
+        menu.add_command(label="＋ 加一条子步骤",
+                         command=lambda: self.add_step_item(item_id))
         if total:
             menu.add_command(label="清空子步骤",
                              command=lambda: self._clear_steps(item_id))
@@ -3280,10 +3309,30 @@ class TodoWidget(object):
         menu = self._build_row_menu(item_id)
         if menu is None:
             return
+        self._dismiss_row_menu()               # 先收起上一个，别堆着
+        self._row_menu = menu
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _dismiss_row_menu(self, event=None):
+        """收起右键菜单：点别处、再右键、或菜单被选过之后都走这里。
+
+        Tk 自己的"点外部自动收起"在这套无边框窗口上不可靠（实测点空白处菜单不走），
+        所以额外挂一条全局绑定兜底，并且**销毁**菜单控件，免得每次右键都堆一个。
+        """
+        menu, self._row_menu = self._row_menu, None
+        if menu is None:
+            return
+        try:
+            menu.unpost()
+        except tk.TclError:
+            pass
+        try:
+            menu.destroy()
+        except tk.TclError:
+            pass
 
     def _clear_steps(self, item_id):
         if self.store.set_steps(item_id, []) is not None:
@@ -3316,6 +3365,7 @@ class TodoWidget(object):
                   height=max(self.px(20), height - 2 * self.px(2)))
         box.bind("<Escape>", lambda event: self._end_steps_edit(save=False))
         box.bind("<Return>", self._steps_save_key)            # 回车＝保存退出
+        box.bind("<KP_Enter>", self._steps_save_key)          # 小键盘回车同样＝保存
         box.bind("<Control-Return>", self._steps_newline_key)  # Ctrl+回车＝换行
         box.bind("<FocusOut>", lambda event: self._end_steps_edit(save=True))
         self.hint.configure(text="回车=保存 · Ctrl+回车=换行 · Esc=取消 · 点别处也算保存",
@@ -3948,6 +3998,33 @@ def run_check():
                 if saved_now != ["回车保存的第一行", "回车保存的第二行"]:
                     problems.append("按回车保存的内容不对: %r" % (saved_now,))
 
+            # 小键盘回车 / 点别处收菜单 / 右键加子步骤
+            src2 = open(__file__, encoding="utf-8").read()
+            kp_steps = 'box.bind("<KP_Enter>", self.' + '_steps_save_key)'
+            kp_entry = 'entry.bind("<KP_Enter>"'
+            if kp_steps not in src2 or kp_entry not in src2:
+                problems.append("小键盘回车没接上（子步骤框和主文字框都要接 KP_Enter）")
+            if not widget.root.bind_all("<Button-1>") \
+                    or not widget.root.bind_all("<Button-3>"):
+                problems.append("没有装「点别处收起右键菜单」的全局绑定")
+            probe_menu = widget._build_row_menu(step_item["id"])
+            widget._row_menu = probe_menu
+            widget._dismiss_row_menu()
+            if widget._row_menu is not None:
+                problems.append("收起右键菜单后引用没清掉")
+            elif probe_menu.winfo_exists():
+                problems.append("收起右键菜单后控件没销毁（会越堆越多）")
+            steps_before_add = len(widget.store.steps_of(step_item))
+            widget.add_step_item(step_item["id"])
+            if len(widget.store.steps_of(step_item)) != steps_before_add + 1:
+                problems.append("「＋ 加一条子步骤」没有加出一条")
+            widget.store.set_steps(step_item["id"],
+                                   [{"text": "步骤%d" % i, "done": False}
+                                    for i in range(STEP_MAX)])
+            widget.add_step_item(step_item["id"])
+            if len(widget.store.steps_of(step_item)) != STEP_MAX:
+                problems.append("加子步骤也要受 %d 条上限约束" % STEP_MAX)
+
             # 全勾上（显式设成完成，别用 toggle —— 有的本来就是勾着的）：进度变强调色
             widget.store.set_steps(step_item["id"],
                                    [{"text": st["text"], "done": True}
@@ -4042,7 +4119,8 @@ def run_check():
             menu = widget._build_row_menu(mark_item["id"])
             labels = " ".join(menu_label(menu, i)
                               for i in range(menu.index("end") + 1))
-            for wanted in ("等待中", "今天要办的", "优先级", "编辑子步骤", "删除这条"):
+            for wanted in ("等待中", "今天要办的", "优先级", "编辑子步骤",
+                           "＋ 加一条子步骤", "删除这条"):
                 if wanted not in labels:
                     problems.append("右键菜单缺少「%s」: %r" % (wanted, labels))
             probe = {"id": -1, "text": "x", "done": False, "state": STATE_TODO,
