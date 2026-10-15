@@ -2726,7 +2726,13 @@ class TodoWidget(object):
             return
         zone = press["zone"]
         if zone == "step-area":
-            return                       # 点的是子步骤那一行的空白处：什么也不做
+            # 点子步骤那一行的文字（不是小方框）：直接进子步骤编辑，光标落在这一行。
+            # 原来这里是空的 —— 用户点步骤文字毫无反应，看起来就像"子步骤编不了"。
+            widget_now = self._row_widget(press["id"])
+            if widget_now is not None:
+                self._begin_steps_edit(press["id"],
+                                       step_index=self._step_index_at(widget_now, event))
+            return
         if zone == "step":
             widget = self._row_widget(press["id"])
             hit = None
@@ -3948,6 +3954,14 @@ def run_check():
                     problems.append("点子步骤文字不该改动勾选")
                 if widget.store.state_of(step_item) == STATE_DONE:
                     problems.append("点子步骤文字不该把主条目标成已完成")
+                if widget._steps_edit is None:
+                    problems.append("点子步骤文字应当打开子步骤编辑器（点了没反应＝编不了）")
+                else:
+                    line_now = int(widget._steps_edit[0].index("insert").split(".")[0])
+                    if line_now != 2:
+                        problems.append("点第 2 条子步骤文字时，光标应当落在第 2 行: %r"
+                                        % (line_now,))
+                    widget._end_steps_edit(save=False)
                 # 双击落在子步骤那一行 → 进子步骤编辑（不是主文字编辑、也不是没反应）
                 widget._begin_edit(step_item["id"], _StubEvent(x=step_text_x, y=cy))
                 if widget._edit_entry is not None:
