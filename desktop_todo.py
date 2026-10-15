@@ -3315,9 +3315,10 @@ class TodoWidget(object):
                   width=max(self.px(60), self._marker_zone_start() - self.text_x),
                   height=max(self.px(20), height - 2 * self.px(2)))
         box.bind("<Escape>", lambda event: self._end_steps_edit(save=False))
-        box.bind("<Control-Return>", lambda event: self._end_steps_edit(save=True))
+        box.bind("<Return>", self._steps_save_key)            # 回车＝保存退出
+        box.bind("<Control-Return>", self._steps_newline_key)  # Ctrl+回车＝换行
         box.bind("<FocusOut>", lambda event: self._end_steps_edit(save=True))
-        self.hint.configure(text="回车=换行 · Ctrl+回车=保存 · Esc=取消 · 点别处也算保存",
+        self.hint.configure(text="回车=保存 · Ctrl+回车=换行 · Esc=取消 · 点别处也算保存",
                             fg=C_ACCENT)
         self._steps_edit = (box, item_id)
         try:
@@ -3326,6 +3327,21 @@ class TodoWidget(object):
         except tk.TclError:
             pass
         return box
+
+    def _steps_save_key(self, event=None):
+        """子步骤编辑器里按回车：保存退出。"""
+        self._end_steps_edit(save=True)
+        return "break"                     # 别再往已销毁的框里插换行
+
+    def _steps_newline_key(self, event=None):
+        """子步骤编辑器里 Ctrl+回车：在光标处换行（编辑器不关）。"""
+        record = self._steps_edit
+        if record is not None:
+            try:
+                record[0].insert("insert", "\n")
+            except tk.TclError:
+                pass
+        return "break"
 
     def _end_steps_edit(self, save=True):
         """收掉子步骤编辑器：save=False 直接丢弃；save=True 按行写回（保留原勾选）。"""
@@ -3876,9 +3892,23 @@ def run_check():
                     problems.append("编辑器内容不对: %r" % (text_now,))
                 if widget._redraw_row(step_item["id"]):
                     problems.append("子步骤编辑器开着时不该重画那一行")
-                if "Ctrl+回车" not in str(widget.hint.cget("text")):
-                    problems.append("子步骤编辑器开着时，底部应当提示怎么退出: %r"
+                if "回车=保存" not in str(widget.hint.cget("text")):
+                    problems.append("子步骤编辑器开着时，底部应当写成「回车=保存」: %r"
                                     % (widget.hint.cget("text"),))
+                src = open(__file__, encoding="utf-8").read()
+                # 要搜的串拼出来 —— 直接写字面量的话，检查自己的源码里就有一份，
+                # 于是"永远找得到"、反例抓不到（这个坑实测过：swapped 绑定仍报 SELFTEST OK）。
+                want_return = 'box.bind("<Return>", self.' + '_steps_save_key)'
+                want_ctrl = 'box.bind("<Control-Return>", self.' + '_steps_newline_key)'
+                if want_return not in src or want_ctrl not in src:
+                    problems.append("按键接线不对：回车要接 _steps_save_key、"
+                                    "Ctrl+回车要接 _steps_newline_key")
+                chars_before = len(box.get("1.0", "end"))
+                widget._steps_newline_key()                 # 等价于按 Ctrl+回车
+                if widget._steps_edit is None:
+                    problems.append("Ctrl+回车 不该退出编辑（它的活是换行）")
+                elif len(box.get("1.0", "end")) != chars_before + 1:
+                    problems.append("Ctrl+回车 没有换行: %r" % (box.get("1.0", "end"),))
                 box.delete("1.0", "end")
                 box.insert("end", "步骤甲改了\n步骤丙\n新加的第四步\n")
                 widget._end_steps_edit(save=True)
@@ -3889,7 +3919,7 @@ def run_check():
                     problems.append("按行位置保留勾选这条不对: %r" % (steps_saved,))
                 if widget._steps_edit is not None:
                     problems.append("保存后编辑器引用没清掉")
-                if "Ctrl+回车" in str(widget.hint.cget("text")):
+                if "回车=保存" in str(widget.hint.cget("text")):
                     problems.append("编辑器收掉后，底部提示应当恢复: %r"
                                     % (widget.hint.cget("text"),))
             widget._begin_steps_edit(step_item["id"])
@@ -3903,6 +3933,21 @@ def run_check():
                     problems.append("Esc 取消不该改动子步骤")
             else:
                 problems.append("第二次打开子步骤编辑器失败")
+            # 回车＝保存（真按键）：改一行再按回车，编辑器收掉且改动落盘
+            widget._begin_steps_edit(step_item["id"])
+            box_enter = (widget._steps_edit or (None, None))[0]
+            if box_enter is None:
+                problems.append("回车用例打不开子步骤编辑器")
+            else:
+                box_enter.delete("1.0", "end")
+                box_enter.insert("end", "回车保存的第一行\n回车保存的第二行\n")
+                widget._steps_save_key()                    # 等价于按回车
+                if widget._steps_edit is not None:
+                    problems.append("子步骤编辑器里按回车应当保存并退出")
+                saved_now = [s["text"] for s in widget.store.steps_of(step_item)]
+                if saved_now != ["回车保存的第一行", "回车保存的第二行"]:
+                    problems.append("按回车保存的内容不对: %r" % (saved_now,))
+
             # 全勾上（显式设成完成，别用 toggle —— 有的本来就是勾着的）：进度变强调色
             widget.store.set_steps(step_item["id"],
                                    [{"text": st["text"], "done": True}
