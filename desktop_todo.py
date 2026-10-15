@@ -2188,7 +2188,7 @@ class TodoWidget(object):
             widget.bind("<B1-Motion>", self._drag_move)
             widget.bind("<ButtonRelease-1>", self._drag_end)
             widget.bind("<Button-3>", self._popup_menu)
-        head.bind("<Double-Button-1>", lambda event: self.toggle_collapsed())
+        head.bind("<Double-Button-1>", lambda event, *args: self.toggle_collapsed())
 
     def _build_tags(self):
         """顶部情境筛选条：只在有标签时才长出内容（没标签时是个空框，高度≈0）。"""
@@ -2215,8 +2215,8 @@ class TodoWidget(object):
         if active:
             chip.configure(highlightbackground=C_ACCENT, highlightthickness=1)
         chip.bind("<Button-1>", lambda event, t=tag: self.set_filter(t))
-        chip.bind("<Enter>", lambda event: chip.configure(fg=C_ACCENT))
-        chip.bind("<Leave>", lambda event: chip.configure(
+        chip.bind("<Enter>", lambda event, *args: chip.configure(fg=C_ACCENT))
+        chip.bind("<Leave>", lambda event, *args: chip.configure(
             fg=C_ACCENT if active else C_DIM))
         return chip
 
@@ -2243,19 +2243,19 @@ class TodoWidget(object):
         self.entry = tk.Entry(box, bg=C_LIST, fg=C_TEXT, insertbackground=C_TEXT,
                               relief="flat", bd=0, font=self.fonts["base"], highlightthickness=0)
         self.entry.pack(side="left", fill="x", expand=True, padx=self.px(8), pady=self.px(5))
-        self.entry.bind("<Return>", lambda event: self.add_from_entry())
-        self.entry.bind("<Escape>", lambda event: self.entry.delete(0, "end"))
-        self.entry.bind("<FocusIn>", lambda event: self._clear_placeholder())
-        self.entry.bind("<FocusOut>", lambda event: self._set_placeholder())
+        self.entry.bind("<Return>", lambda event, *args: self.add_from_entry())
+        self.entry.bind("<Escape>", lambda event, *args: self.entry.delete(0, "end"))
+        self.entry.bind("<FocusIn>", lambda event, *args: self._clear_placeholder())
+        self.entry.bind("<FocusOut>", lambda event, *args: self._set_placeholder())
         self.entry.bind("<Button-1>", self._focus_entry)
         self._set_placeholder()
 
         add_btn = tk.Label(row, text="+", bg=C_ACCENT, fg="#ffffff", font=self.fonts["bold"],
                            width=2, cursor="hand2")
         add_btn.pack(side="left", padx=(self.px(6), 0), ipady=self.px(5))
-        add_btn.bind("<Button-1>", lambda event: self.add_from_entry())
-        add_btn.bind("<Enter>", lambda event: add_btn.configure(bg="#5aa6ff"))
-        add_btn.bind("<Leave>", lambda event: add_btn.configure(bg=C_ACCENT))
+        add_btn.bind("<Button-1>", lambda event, *args: self.add_from_entry())
+        add_btn.bind("<Enter>", lambda event, *args: add_btn.configure(bg="#5aa6ff"))
+        add_btn.bind("<Leave>", lambda event, *args: add_btn.configure(bg=C_ACCENT))
 
     def _build_list(self):
         self.list_area = tk.Frame(self.card, bg=C_LIST)
@@ -2277,14 +2277,14 @@ class TodoWidget(object):
         # 「撤销」只在刚删掉一条时出现（见 _show_undo / _clear_undo），平时不占位置
         self.undo_btn = tk.Label(foot, text="撤销删除", bg=C_CARD, fg=C_ACCENT,
                                  font=self.fonts["small"], cursor="hand2")
-        self.undo_btn.bind("<Button-1>", lambda event: self.undo_delete())
-        self.undo_btn.bind("<Enter>", lambda event: self.undo_btn.configure(fg=C_TEXT))
-        self.undo_btn.bind("<Leave>", lambda event: self.undo_btn.configure(fg=C_ACCENT))
+        self.undo_btn.bind("<Button-1>", lambda event, *args: self.undo_delete())
+        self.undo_btn.bind("<Enter>", lambda event, *args: self.undo_btn.configure(fg=C_TEXT))
+        self.undo_btn.bind("<Leave>", lambda event, *args: self.undo_btn.configure(fg=C_ACCENT))
         self.clear_btn = tk.Label(foot, text="归档已完成", bg=C_CARD, fg=C_DIM,
                                   font=self.fonts["small"], cursor="hand2")
-        self.clear_btn.bind("<Button-1>", lambda event: self.clear_done())
-        self.clear_btn.bind("<Enter>", lambda event: self.clear_btn.configure(fg=C_TEXT))
-        self.clear_btn.bind("<Leave>", lambda event: self.clear_btn.configure(fg=C_DIM))
+        self.clear_btn.bind("<Button-1>", lambda event, *args: self.clear_done())
+        self.clear_btn.bind("<Enter>", lambda event, *args: self.clear_btn.configure(fg=C_TEXT))
+        self.clear_btn.bind("<Leave>", lambda event, *args: self.clear_btn.configure(fg=C_DIM))
 
     def _build_menu(self):
         menu = tk.Menu(self.root, tearoff=0)
@@ -2313,9 +2313,9 @@ class TodoWidget(object):
                            highlightthickness=0, cursor="hand2")
         canvas._kind = kind
         self._draw_icon(canvas, kind, C_DIM)
-        canvas.bind("<Button-1>", lambda event: command())
-        canvas.bind("<Enter>", lambda event: self._draw_icon(canvas, kind, C_TEXT))
-        canvas.bind("<Leave>", lambda event: self._draw_icon(canvas, kind, C_DIM))
+        canvas.bind("<Button-1>", lambda event, *args: command())
+        canvas.bind("<Enter>", lambda event, *args: self._draw_icon(canvas, kind, C_TEXT))
+        canvas.bind("<Leave>", lambda event, *args: self._draw_icon(canvas, kind, C_DIM))
         return canvas
 
     def _draw_icon(self, canvas, kind, color):
@@ -3237,10 +3237,10 @@ class TodoWidget(object):
                     width=max(self.px(40),
                               self.list_w - self.text_x - self.del_w - self.px(2)),
                     height=max(self.px(16), height - 2 * self.px(2)))
-        entry.bind("<Return>", lambda event: self._end_edit(save=True))
-        entry.bind("<KP_Enter>", lambda event: self._end_edit(save=True))   # 小键盘回车
-        entry.bind("<Escape>", lambda event: self._end_edit(save=False))
-        entry.bind("<FocusOut>", lambda event: self._end_edit(save=True))
+        entry.bind("<Return>", lambda event, *args: self._end_edit(save=True))
+        entry.bind("<KP_Enter>", lambda event, *args: self._end_edit(save=True))   # 小键盘回车
+        entry.bind("<Escape>", lambda event, *args: self._end_edit(save=False))
+        entry.bind("<FocusOut>", lambda event, *args: self._end_edit(save=True))
         self._edit_id = item_id
         self._edit_entry = entry
         try:
@@ -3366,11 +3366,11 @@ class TodoWidget(object):
         box.place(x=self.text_x - self.px(2), y=self.px(2),
                   width=max(self.px(60), self._marker_zone_start() - self.text_x),
                   height=max(self.px(20), height - 2 * self.px(2)))
-        box.bind("<Escape>", lambda event: self._end_steps_edit(save=False))
+        box.bind("<Escape>", lambda event, *args: self._end_steps_edit(save=False))
         box.bind("<Return>", self._steps_save_key)            # 回车＝保存退出
         box.bind("<KP_Enter>", self._steps_save_key)          # 小键盘回车同样＝保存
         box.bind("<Control-Return>", self._steps_newline_key)  # Ctrl+回车＝换行
-        box.bind("<FocusOut>", lambda event: self._end_steps_edit(save=True))
+        box.bind("<FocusOut>", lambda event, *args: self._end_steps_edit(save=True))
         self.hint.configure(text="回车=保存 · Ctrl+回车=换行 · Esc=取消 · 点别处也算保存",
                             fg=C_ACCENT)
         self._steps_edit = (box, item_id)
