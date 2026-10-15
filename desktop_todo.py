@@ -3378,7 +3378,8 @@ class TodoWidget(object):
         box = tk.Text(widget, bg=C_BORDER, fg=C_TEXT, insertbackground=C_TEXT,
                       relief="flat", bd=0, highlightthickness=0,
                       font=self.fonts["base"], wrap="none")
-        for step in self.store.steps_of(item):
+        steps = self.store.steps_of(item)
+        for step in steps:
             box.insert("end", step["text"] + "\n")
         height = int(widget.cget("height"))
         box.place(x=self.text_x - self.px(2), y=self.px(2),
@@ -3960,7 +3961,8 @@ def run_check():
                                         % (cursor_line,))
                     widget._end_steps_edit(save=False)     # 收掉，别影响后面的用例
                 # 右键条目的绑定必须在（子步骤编辑器的入口）
-                if not row_steps.bind("<Button-3>"):
+                fresh_row = widget._row_widget(step_item["id"])   # 上面收编辑器时重画过，旧引用已销毁
+                if fresh_row is None or not fresh_row.bind("<Button-3>"):
                     problems.append("条目没有绑定右键菜单，子步骤编辑器就没有入口")
             # 编辑器：内容、保存（按行保留勾选）、Esc 取消
             widget._begin_steps_edit(step_item["id"])
