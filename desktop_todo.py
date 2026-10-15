@@ -3208,7 +3208,11 @@ class TodoWidget(object):
             widget_now = self._row_widget(item_id)
             if widget_now is not None and getattr(event, "y", 0) >= \
                     getattr(widget_now, "_step_top", 1e9):
-                return                     # 双击在子步骤那一行上：也不当改主文字
+                # 双击在子步骤那一行上：进"子步骤编辑"，光标落在双击的那一行，
+                # 而不是什么都不做、也不是去改主文字（这两点都踩过）
+                self._begin_steps_edit(item_id,
+                                       step_index=self._step_index_at(widget_now, event))
+                return
         self._cancel_regroup()             # 编辑期间不归位：_refresh() 会把输入框一起销毁
         self._end_steps_edit(save=True)    # 子步骤编辑器也先收掉
         if self._edit_entry is not None:
@@ -3349,7 +3353,15 @@ class TodoWidget(object):
                 self._refresh()
 
     # ---- 子步骤编辑（右键条目 → 编辑子步骤…）----
-    def _begin_steps_edit(self, item_id):
+    def _step_index_at(self, canvas, event):
+        """双击落在第几条子步骤上（靠行内已记下的小方框命中区算）。"""
+        y = getattr(event, "y", 0)
+        for index, y0, y1, _x0, _x1 in getattr(canvas, "_step_boxes", None) or []:
+            if y0 <= y < y1:
+                return index
+        return None
+
+    def _begin_steps_edit(self, item_id, step_index=None):
         """在那一行上盖一个多行输入框，每行一个子步骤。
 
         回车是换行，所以保存用 **Ctrl+回车** 或点到别处，Esc 取消。
@@ -3382,7 +3394,10 @@ class TodoWidget(object):
         self._steps_edit = (box, item_id)
         try:
             box.focus_force()
-            box.mark_set("insert", "end-1c")
+            if step_index is not None and 0 <= step_index < len(steps):
+                box.mark_set("insert", "%d.0" % (step_index + 1))
+            else:
+                box.mark_set("insert", "end-1c")
         except tk.TclError:
             pass
         return box
@@ -3932,10 +3947,18 @@ def run_check():
                     problems.append("点子步骤文字不该改动勾选")
                 if widget.store.state_of(step_item) == STATE_DONE:
                     problems.append("点子步骤文字不该把主条目标成已完成")
-                # 双击落在子步骤那一行 → 不该进主文字编辑
+                # 双击落在子步骤那一行 → 进子步骤编辑（不是主文字编辑、也不是没反应）
                 widget._begin_edit(step_item["id"], _StubEvent(x=step_text_x, y=cy))
                 if widget._edit_entry is not None:
                     problems.append("双击子步骤那一行不该打开主文字编辑框")
+                if widget._steps_edit is None:
+                    problems.append("双击子步骤那一行应当打开子步骤编辑器（否则双击没反应）")
+                else:
+                    cursor_line = int(widget._steps_edit[0].index("insert").split(".")[0])
+                    if cursor_line != 2:
+                        problems.append("双击第 2 条子步骤时，光标应当落在第 2 行: %r"
+                                        % (cursor_line,))
+                    widget._end_steps_edit(save=False)     # 收掉，别影响后面的用例
                 # 右键条目的绑定必须在（子步骤编辑器的入口）
                 if not row_steps.bind("<Button-3>"):
                     problems.append("条目没有绑定右键菜单，子步骤编辑器就没有入口")
