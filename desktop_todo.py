@@ -946,16 +946,57 @@ class PlatformBackend(object):
     def hotkey_remove(self):
         """注销全局快捷键（退出前调用）。"""
 
+    def write_diag(self, text):
+        """写一行唤回诊断日志；失败就算了，不影响使用。
+
+        路径优先用 `self.diag_path`（由界面层设成"当前数据文件旁边的 hotkey.log"）——
+        这样自检跑在临时目录里就不会往用户真实数据目录写东西。
+        """
+        try:
+            target = getattr(self, "diag_path", None)
+            if target:
+                with open(target, "a", encoding="utf-8") as handle:
+                    handle.write("%s\t%s\n"
+                                 % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+                return
+            directory = self.data_dir()
+            if not os.path.isdir(directory):
+                os.makedirs(directory)
+            with open(os.path.join(directory, "hotkey.log"), "a", encoding="utf-8") as handle:
+                handle.write("%s\t%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+        except (IOError, OSError):
+            pass
+
     def activate_window(self, root, topmost):
-        """把窗口叫到最前面，且不改变用户设置的「始终置顶」状态。"""
+        """把窗口叫到最前面，且不改变用户设置的「始终置顶」状态。
+
+        这里也是**所有唤回路径的总闸门**（全局快捷键 / 再跑一次 / 隐藏后唤回）——
+        所以诊断日志写在这里，而不是某个具体的入口。
+        """
+        before, remap = "", False
+        try:
+            before = "state=%s viewable=%s" % (root.state(), root.winfo_viewable())
+            remap = root.state() != "normal"
+        except tk.TclError:
+            pass
+        self.write_diag("activate 前: %s remap=%s" % (before, remap))
         try:
             root.deiconify()
             root.lift()
             root.attributes("-topmost", True)      # 短暂置顶，确保能从别的窗口后面冒出来
             root.focus_force()
+            if remap:
+                # 有的 WM（例如 DDE 的"显示桌面"）把窗口留在 Iconic/Withdrawn 状态，
+                # 只 deiconify 拉不回来 —— 做一次 withdraw→deiconify 强制重新映射。
+                root.withdraw()
+                root.deiconify()
+                root.lift()
+                root.focus_force()
             root.after(400, lambda: root.attributes("-topmost", bool(topmost)))
-        except tk.TclError:
-            pass
+            self.write_diag("activate 后: state=%s viewable=%s"
+                            % (root.state(), root.winfo_viewable()))
+        except tk.TclError as error:
+            self.write_diag("activate 失败: %r" % (error,))
 
     def single_instance_start(self, root, on_raise):
         """接管单实例：第二个进程需要唤回时调用 on_raise()。"""
@@ -2074,6 +2115,8 @@ class TodoWidget(object):
                 self.root, self.raise_window, self._popup_menu_at_cursor)
             # 全局快捷键：不占任务栏、又没有托盘时，这是最可靠的唤回入口
             self._hotkey_spec = self.store.ui.get("hotkey") or HOTKEY_DEFAULT
+            self.backend.diag_path = os.path.join(os.path.dirname(self.store.path),
+                                                  "hotkey.log")
             self._hotkey_on = self.backend.hotkey_install(
                 self.root, self._hotkey_spec, self.raise_window)
 
@@ -2170,6 +2213,8 @@ class TodoWidget(object):
 
         self._build_header()
         self.filter_tag = None            # 顶部情境筛选：None = 看全部
+        # 唤回诊断日志写在"当前数据文件旁边"（自检跑临时目录时就不会碰用户真实数据）
+        self.backend.diag_path = os.path.join(os.path.dirname(self.store.path), "hotkey.log")
         self._build_input()
         self._build_tags()
         self._build_list()
@@ -4283,6 +4328,22 @@ def run_check():
             for extra_id in (tagged["id"], no_tag_item["id"]):
                 widget.store.pop(extra_id)
             widget._refresh()
+
+            # 唤回总闸门：写日志 + 必要时强制重映射（真调一次，看日志里有没有前后状态）
+            widget.backend.activate_window(widget.root, False)
+            widget.root.withdraw()                    # 别把自检窗口真的弹出来
+            try:
+                with open(os.path.join(os.path.dirname(widget.store.path), "hotkey.log"),
+                          encoding="utf-8") as handle:
+                    log_text = handle.read()
+            except IOError:
+                log_text = ""
+            if "activate 前:" not in log_text:
+                problems.append("唤回函数没有写诊断日志（下次唤不回来还是没法定位）")
+            if "remap=" not in log_text:
+                problems.append("诊断日志里没有 remap 判定")
+            if not widget.backend.write_diag or "activate" not in log_text:
+                problems.append("唤回日志内容不对")
 
             # 诊断日志：能真写出文件（下次"唤不回来"靠它定位）
             widget._diag_log("selftest-probe")
