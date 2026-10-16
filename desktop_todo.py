@@ -2097,15 +2097,37 @@ class TodoWidget(object):
             except tk.TclError:
                 pass
 
+    def _diag_log(self, text):
+        """把"唤回/隐藏"的判定写一行日志（只记录，不改行为）。
+
+        用途：Super+D 之后 Super+T 唤不回来这类"只在 WM 特定状态下出现"的问题，
+        靠猜没用 —— 让用户复现一次，看这行日志里的 viewable / wm_state 到底是什么。
+        日志和数据文件同目录（~/.local/share/desktop-todo/hotkey.log）。
+        """
+        try:
+            path = os.path.join(os.path.dirname(self.store.path), "hotkey.log")
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write("%s\t%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+        except (IOError, OSError):
+            pass
+
     def toggle_hidden(self):
         """隐藏 / 显示窗口：隐藏之后从托盘图标左键唤回（免得和「退出」混在一起）。"""
         try:
-            if self.root.winfo_viewable():
+            viewable = bool(self.root.winfo_viewable())
+            state = ""
+            try:
+                state = self.root.state()
+            except tk.TclError:
+                pass
+            self._diag_log("hotkey viewable=%s wm_state=%s -> %s"
+                           % (viewable, state, "withdraw" if viewable else "activate"))
+            if viewable:
                 self.root.withdraw()
             else:
                 self.raise_window()
-        except tk.TclError:
-            pass
+        except tk.TclError as error:
+            self._diag_log("hotkey 失败: %r" % (error,))
 
     # ---- 字体 ----
     def _make_fonts(self):
@@ -4261,6 +4283,16 @@ def run_check():
             for extra_id in (tagged["id"], no_tag_item["id"]):
                 widget.store.pop(extra_id)
             widget._refresh()
+
+            # 诊断日志：能真写出文件（下次"唤不回来"靠它定位）
+            widget._diag_log("selftest-probe")
+            log_path = os.path.join(os.path.dirname(widget.store.path), "hotkey.log")
+            try:
+                with open(log_path, encoding="utf-8") as handle:
+                    if "selftest-probe" not in handle.read():
+                        problems.append("诊断日志没有真的写出来（下次没法定位唤回问题）")
+            except IOError:
+                problems.append("诊断日志文件不存在")
 
             # ---- 归档：过 00:00 自动收走已完成的；删除进归档、可撤销 ----
             arc_path = os.path.join(temp_dir, "archive.json")
